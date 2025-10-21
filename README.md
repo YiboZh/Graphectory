@@ -2,7 +2,7 @@
 
 **Process-centric analysis of agentic software systems.**
 
-Graphectory transforms agent execution traces into structured, multi-phase process graphs that capture the problem-solving patterns of AI software engineering agents. By modeling agent actions as directed graphs with phase classification (localization, patching, validation), this tool enables systematic analysis of how agents approach and solve software engineering tasks.
+Graphectory transforms agent execution traces into structured graphs that capture the problem-solving patterns of AI software engineering agents. By modeling agent actions as directed graphs with phase classification (localization, patching, validation), this tool enables systematic analysis of how agents approach and solve software engineering tasks.
 
 ---
 
@@ -141,5 +141,25 @@ To add support for a new agent framework:
    - Add conditional branch in `GraphProcessor.process_trajectory()`
 
 **Key principle**: Different agents have different trajectory formats, but all generate the same unified graph structure (nodes with phases, execution/hierarchical edges, metadata).
+
+---
+
+## Graph Analysis
+
+Pre-computed analysis results for the full dataset are available under [data/{OpenHands|SWE-agent}/analysis](data/), including Graphectory metrics.
+
+### Analyze Pre-computed Graphs
+
+```bash
+python -m graph_analysis.batch_runner
+```
+
+### Analyze Custom Graphs
+
+```bash
+python -m graph_analysis.batch_runner --data-dir ./my_data --output-dir ./my_output
+```
+
+Results are saved to `trajectory_metrics.csv`.
 
 ---

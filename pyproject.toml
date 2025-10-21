@@ -11,6 +11,7 @@ dependencies = [
     "bashlex",
     "matplotlib",
     "networkx",
+    "pandas",
     "pyyaml",
     "datasets",
     "pygraphviz"

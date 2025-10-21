@@ -1,15 +1,12 @@
-import os
-import json
-import sys
-import networkx as nx
-import matplotlib.pyplot as plt
-import pandas as pd
-from collections import defaultdict, Counter
-from statistics import mean
-from gsppy.gsp import GSP
-from write_summary import write_summary_file
+"""Computation module for trajectory graph analysis."""
 
-# --------------------------- Graph Analyzer ---------------------------
+from collections import Counter, defaultdict
+from statistics import mean
+from typing import Any
+
+import networkx as nx
+
+
 class TrajectoryGraphAnalyzer:
     def __init__(self, graph_data):
         self.raw_data = graph_data
@@ -27,7 +24,7 @@ class TrajectoryGraphAnalyzer:
             "exec_edge_count": len(self.get_exec_edges()),
             "hier_edge_count": len(self.get_hier_edges()),
             "step_count": self.get_step_count(),
-            "longest_path": self.get_longest_simple_path(),
+            "longest_path": self.get_longest_prime_path(),
             "avg_out_degree": self.get_avg_out_degree(),
             "loop_count": self.get_loop_count(),
             "avg_loop_length": self.get_avg_loop_length(),
@@ -182,19 +179,90 @@ class TrajectoryGraphAnalyzer:
             return 0
         path = nx.dag_longest_path(C) if C.number_of_nodes() > 0 else []
         return max(len(path) - 1, 0)
+    
+    def _earliest_step(self, node) -> int:
+        """Helper: earliest step index for ordering/pruning."""
+        steps = self.graph.nodes[node].get("step_indices", [])
+        if not steps:
+            return float("inf")
+        try:
+            return int(min(steps))
+        except Exception:
+            numeric = [s for s in steps if isinstance(s, (int, float))]
+            return int(min(numeric)) if numeric else float("inf")
+
+    def get_longest_prime_path(self) -> int:
+        """
+        Longest prime path length over exec edges, measured in edges:
+        max |{(v_{i-1}, v_i)}| such that all v_i are distinct and (v_{i-1}, v_i) ∈ TE.
+
+        Returns:
+            int: number of edges in the longest simple (cycle-free) path.
+        """
+        G = self.get_exec_graph()
+        if G.number_of_nodes() == 0:
+            return 0
+
+        # Order successors by earliest step for consistent exploration (optional).
+        ordered_succ = {u: sorted(G.successors(u), key=self._earliest_step) for u in G.nodes()}
+
+        best_edges = 0  # edge count
+
+        # Iterative DFS to avoid recursion limits
+        for start in G.nodes():
+            stack = [(start, (start,), {start})]  # (current, path_nodes, visited_set)
+            while stack:
+                curr, path, visited = stack.pop()
+
+                # Current path has len(path)-1 edges
+                edges_len = len(path) - 1
+                if edges_len > best_edges:
+                    best_edges = edges_len
+
+                # Simple, cheap upper bound pruning (optional)
+                # Max additional edges ≤ remaining unvisited nodes
+                remaining_cap = G.number_of_nodes() - len(visited)
+                if edges_len + remaining_cap <= best_edges:
+                    continue
+
+                for nxt in ordered_succ.get(curr, []):
+                    if nxt in visited:
+                        # would create a cycle or revisit → skip
+                        continue
+                    stack.append((nxt, path + (nxt,), visited | {nxt}))
+
+        return best_edges
 
     def extract_phase_sequence(self):
-        step_sequence = []
-        for node in self.graph.nodes(data=True):
-            for idx in node[1].get("step_indices", []):
-                step_sequence.append((idx, node[1]))
-        step_sequence.sort(key=lambda x: x[0])
+        """
+        Return a de-duplicated sequence of phases ordered by step_idx.
+        Uses per-node `phases` aligned with `step_indices`. Consecutive duplicates
+        and 'general' phases are omitted (preserves prior behavior).
+        """
+        # Collect (step_idx, phase) for every node occurrence
+        occurrences = []
+        for _, data in self.graph.nodes(data=True):
+            idxs = data.get("step_indices", []) or []
+            phases = data.get("phases", []) or []
+            # Align by position; be robust to length mismatches
+            n = min(len(idxs), len(phases))
+            for i in range(n):
+                occurrences.append((idxs[i], phases[i]))
+            # If some indices lack a corresponding phase (shouldn't happen), fall back safely
+            if len(idxs) > n:
+                fallback = data.get("phase", "general")  # in case some legacy nodes still have 'phase'
+                for i in range(n, len(idxs)):
+                    occurrences.append((idxs[i], fallback))
+
+        # Order by step index
+        occurrences.sort(key=lambda x: x[0])
+
+        # Build sequence, skipping 'general' and collapsing consecutive duplicates
         seq, prev = [], None
-        for _, node in step_sequence:
-            curr = node.get("phase")
-            if curr and curr != "general" and curr != prev:
-                seq.append(curr)
-                prev = curr
+        for _, ph in occurrences:
+            if ph and ph != "general" and ph != prev:
+                seq.append(ph)
+                prev = ph
         return seq
 
     def extract_label_sequence(self):
@@ -230,12 +298,14 @@ class TrajectoryGraphAnalyzer:
         - scroll_behavior: True if overlapping views within same file
         - num_deep_zooms_without_edit: count of leaf nodes explored without edits
         - back_and_forth_switch: True if zigzag pattern detected in view hierarchy
+        - zoom_out: True iff the next localization view is a proper ancestor of the current one
+                    (strict SE↔TE violation; next exec_prefix is a strict structural prefix of current)
         """
-        steps = []
-        loc_nodes_freq = []
+        steps = []  # (step_idx, phase, node_id) per OCCURRENCE (aligned with per-node phases)
+        loc_nodes_freq = []  # frequency per node of localization occurrences
         loc_ranges_by_path = defaultdict(list)
 
-        # -- patch nodes
+        # patch nodes
         patch_paths = set()
         for _, data in self.graph.nodes(data=True):
             label = data.get("label", "")
@@ -244,35 +314,45 @@ class TrajectoryGraphAnalyzer:
                 if path:
                     patch_paths.add(path)
 
-        # -- gather step and localization info
+        # gather step and localization info PER OCCURRENCE
         for node_id, data in self.graph.nodes(data=True):
-            phase = data.get("phase", "")
-            freq = len(data.get("step_indices", []))
-            if phase == "localization":
-                loc_nodes_freq.append(freq)
-                view_range = data.get("args", {}).get("view_range") if isinstance(data.get("args", {}), dict) else None
-                path = data.get("args", {}).get("path") if isinstance(data.get("args", {}), dict) else None
-                if isinstance(view_range, (list, tuple)) and len(view_range) == 2 and path:
-                    loc_ranges_by_path[path].append(tuple(view_range))
-            for idx in data.get("step_indices", []):
-                steps.append((idx, phase, node_id))
-        steps.sort(key=lambda x: x[0])
-        phases = [p for _, p, _ in steps]
+            idxs = data.get("step_indices", []) or []
+            phases = data.get("phases", []) or []
+            n = min(len(idxs), len(phases))
+            # count how many times this node was used for localization
+            loc_count_for_node = 0
+            for i in range(n):
+                idx, ph = idxs[i], phases[i]
+                steps.append((idx, ph, node_id))
+                if ph == "localization":
+                    loc_count_for_node += 1
+                    # collect view ranges per path for scroll detection
+                    if isinstance(data.get("args", {}), dict):
+                        view_range = data["args"].get("view_range")
+                        path = data["args"].get("path")
+                        if isinstance(view_range, (list, tuple)) and len(view_range) == 2 and path:
+                            loc_ranges_by_path[path].append(tuple(view_range))
+            if loc_count_for_node > 0:
+                loc_nodes_freq.append(loc_count_for_node)
 
-        total_actions = len(phases)
+        steps.sort(key=lambda x: x[0])
+        phases_seq = [p for _, p, _ in steps]
+
+        total_actions = len(phases_seq)
         if total_actions == 0:
             return {
                 "loc_focus_ratio": 0, "loc_dominant_zone": "none", "loc_num_clusters": 0,
                 "loc_avg_node_freq": 0, "repeated_view": False,
                 "max_view_depth": 0, "avg_view_depth": 0,
                 "max_view_span": 0, "avg_view_span": 0,
-                "scroll_behavior": False, "num_deep_zooms_without_edit": 0
+                "scroll_behavior": False, "num_deep_zooms_without_edit": 0,
+                "back_and_forth_switch": False, "zoom_out": False
             }
 
-        # -- zone and cluster analysis
+        # -- zone and cluster analysis (over per-occurrence phases)
         bins = [0, 0, 0]
         clusters, current = [], 0
-        for i, p in enumerate(phases):
+        for i, p in enumerate(phases_seq):
             if p == "localization":
                 if i < total_actions // 3: bins[0] += 1
                 elif i < 2 * total_actions // 3: bins[1] += 1
@@ -294,16 +374,16 @@ class TrajectoryGraphAnalyzer:
         loc_avg_freq = round(mean(loc_nodes_freq), 2) if loc_nodes_freq else 0
         repeated_view = any(freq > 1 for freq in loc_nodes_freq)
 
-        # --- Hierarchical structure
+        # --- Hierarchical structure 
         hier_graph = self.get_hier_graph()
         prefix_map = {}
         node_path_map = {}
 
         seen = set()
         def dfs(node, prefix):
-            if node in seen:   
+            if node in seen:
                 return
-            seen.add(node)     
+            seen.add(node)
             prefix_map[node] = prefix
             for i, child in enumerate(list(hier_graph.successors(node))):
                 dfs(child, f"{prefix}-{i}" if prefix else str(i))
@@ -318,7 +398,7 @@ class TrajectoryGraphAnalyzer:
                 node_path_map[node_id] = path
 
         # --- View depth and span analysis ---
-        exec_prefixes = [(nid, prefix_map.get(nid, "")) for _, phase, nid in steps if phase == "localization"]
+        exec_prefixes = [(nid, prefix_map.get(nid, "")) for _, ph, nid in steps if ph == "localization"]
         level_counts = Counter()
         leaf_depths = []
 
@@ -327,17 +407,15 @@ class TrajectoryGraphAnalyzer:
                 continue
             level = prefix.count("-")
             level_counts[level] += 1
-
-            # Check if it's a leaf in the hierarchy
             if hier_graph.out_degree(nid) == 0:
-                leaf_depths.append(level + 1)  # depth = number of segments
+                leaf_depths.append(level + 1)
 
         max_view_span = max(level_counts.values(), default=0)
         avg_view_span = round(mean(level_counts.values()), 2) if level_counts else 0
         max_view_depth = max(leaf_depths, default=0)
         avg_view_depth = round(mean(leaf_depths), 2) if leaf_depths else 0
 
-        # --- scroll behavior
+        # scroll behavior 
         scroll_behavior = False
         for path, ranges in loc_ranges_by_path.items():
             if len(ranges) <= 1:
@@ -350,7 +428,7 @@ class TrajectoryGraphAnalyzer:
             if scroll_behavior:
                 break
 
-        # --- deep zoom without edit
+        # deep zoom without edit
         leaf_nodes = [n for n in hier_graph.nodes if hier_graph.out_degree(n) == 0]
         leaf_paths = {
             node_path_map[n] for n in leaf_nodes
@@ -361,7 +439,7 @@ class TrajectoryGraphAnalyzer:
         ]
         num_deep_zooms_without_edit = len(deep_zooms_without_edit)
 
-        # --- back-and-forth switch detection (formal L3 across ALL occurrences) ---
+        # back-and-forth switch detection
         def _cp_len_from_code(code1: str, code2: str) -> int:
             """Common prefix length of two DFS path codes like '0-2-1'."""
             s1, s2 = code1.split("-"), code2.split("-")
@@ -370,26 +448,20 @@ class TrajectoryGraphAnalyzer:
                 i += 1
             return i
 
-        # Build occurrence-level localization code sequence (execution order, duplicates kept)
         loc_codes: list[str] = []
-        for _, phase, nid in steps:            # 'steps' is already sorted by step index
-            if phase == "localization":
+        for _, ph, nid in steps:  # steps sorted by step index
+            if ph == "localization":
                 code = prefix_map.get(nid, "")
-                if code:                        # only keep if we have a hierarchy code
+                if code:
                     loc_codes.append(code)
 
         back_and_forth_switch = False
         m = len(loc_codes)
         if m >= 3:
-            # Precompute cp(i,j) for i<j
             cp = [[0] * m for _ in range(m)]
             for i in range(m):
-                ci = loc_codes[i]
                 for j in range(i + 1, m):
-                    cp[i][j] = _cp_len_from_code(ci, loc_codes[j])
-
-            # Search for any i<j<k satisfying:
-            # cp(v1,v3) >= max(cp(v1,v2), cp(v2,v3)) and cp(v1,v2) != cp(v2,v3)
+                    cp[i][j] = _cp_len_from_code(loc_codes[i], loc_codes[j])
             for i in range(m - 2):
                 for j in range(i + 1, m - 1):
                     cp12 = cp[i][j]
@@ -401,6 +473,15 @@ class TrajectoryGraphAnalyzer:
                             break
                     if back_and_forth_switch:
                         break
+
+        # zoom_out detection
+        zoom_out = False
+        for i in range(len(loc_codes) - 1):
+            c1, c2 = loc_codes[i], loc_codes[i + 1]
+            s1, s2 = c1.split("-"), c2.split("-")
+            if len(s2) < len(s1) and s1[:len(s2)] == s2:
+                zoom_out = True
+                break
 
         return {
             "loc_focus_ratio": ratio,
@@ -414,7 +495,8 @@ class TrajectoryGraphAnalyzer:
             "avg_view_span": avg_view_span,
             "scroll_behavior": scroll_behavior,
             "num_deep_zooms_without_edit": num_deep_zooms_without_edit,
-            "back_and_forth_switch": back_and_forth_switch
+            "back_and_forth_switch": back_and_forth_switch,
+            "zoom_out": zoom_out,
         }
 
     def get_patch_summary(self):
@@ -432,21 +514,24 @@ class TrajectoryGraphAnalyzer:
                 - abandonment: True if there exists a file with ≥1 attempts and no success on that file).
                 - fail_to_success_patterns: common reasoning phase transitions from a failed to successful patch.
         """
-        patch_nodes = []
-        step_node_map = {}
+        patch_nodes = []        # list of (step_idx, node_id, data) for occurrences where phase == "patch"
+        step_node_map = {}      # step_idx -> (node_id, data, phase) for every occurrence
 
-        # First, extract all patch nodes and build a step-to-node map
+        # Build per-occurrence maps
         for node_id, data in self.graph.nodes(data=True):
-            phase = data.get("phase", "")
-            if phase == "patch":
-                for step in data.get("step_indices", []):
+            idxs = data.get("step_indices", []) or []
+            phases = data.get("phases", []) or []
+            n = min(len(idxs), len(phases))
+            for i in range(n):
+                step = idxs[i]
+                ph = phases[i]
+                step_node_map[step] = (node_id, data, ph)
+                if ph == "patch":
                     patch_nodes.append((step, node_id, data))
-            for step in data.get("step_indices", []):
-                step_node_map[step] = (node_id, data)
 
         # Sort the patch_nodes based on step indices
         patch_nodes.sort(key=lambda x: x[0])
-        patch_steps = sorted(step_node_map.keys())
+        patch_steps = [s for s, _, _ in patch_nodes]  # strictly patch steps in order
 
         patch_total = len(patch_nodes)
         patch_success = 0
@@ -471,27 +556,25 @@ class TrajectoryGraphAnalyzer:
         file_attempts = Counter()     # path -> #attempts
         file_has_success = set()      # paths that ever succeeded
 
-        # Reasoning span detection between patches
+        # Reasoning span detection between PATCH steps
         for i in range(len(patch_steps) - 1):
             span = list(range(patch_steps[i] + 1, patch_steps[i + 1]))
-            phases = []
+            phases_between = []
             for s in span:
-                _, node_data = step_node_map.get(s, (None, {}))
-                if node_data:
-                    phase = node_data.get("phase", "unknown")
-                    if phase != "patch":
-                        phases.append(phase)
-            if phases:
-                reasoning_between_patches.append(phases)
-                deduped = [p for i, p in enumerate(phases) if i == 0 or p != phases[i-1]]
+                _, node_data, ph = step_node_map.get(s, (None, {}, "unknown"))
+                if ph != "patch":
+                    phases_between.append(ph)
+            if phases_between:
+                reasoning_between_patches.append(phases_between)
+                deduped = [p for j, p in enumerate(phases_between) if j == 0 or p != phases_between[j-1]]
                 reasoning_transitions[tuple(deduped)] += 1
 
         for step, node_id, data in patch_nodes:
             args = data.get("args", {})
-            path = args.get("path", "")
-            old_str = args.get("old_str", "")
-            new_str = args.get("new_str", "")
-            status_raw = args.get("edit_status", "")
+            path = args.get("path", "") if isinstance(args, dict) else ""
+            old_str = args.get("old_str", "") if isinstance(args, dict) else ""
+            new_str = args.get("new_str", "")  if isinstance(args, dict) else ""
+            status_raw = args.get("edit_status", "") if isinstance(args, dict) else ""
             edit_key = (path, old_str, new_str)
 
             # Count per-file attempts
@@ -517,6 +600,9 @@ class TrajectoryGraphAnalyzer:
             # Flip-flop check (undo)
             if edit_history and edit_key == (edit_history[-1][0], edit_history[-1][2], edit_history[-1][1]):
                 flip_flop = True
+            # undo_edit
+            if data.get("label", "") == "str_replace_editor: undo_edit":
+                flip_flop = True
 
             # Reasoning transitions from fail -> success
             if previous_status != "success" and status == "success":
@@ -524,14 +610,12 @@ class TrajectoryGraphAnalyzer:
                     span = list(range(previous_step + 1, step))
                     inter_phases = []
                     for s in span:
-                        _, node_data = step_node_map.get(s, (None, {}))
-                        if node_data:
-                            phase = node_data.get("phase", "unknown")
-                            if phase != "patch":
-                                inter_phases.append(phase)
+                        _, _, ph = step_node_map.get(s, (None, {}, "unknown"))
+                        if ph != "patch":
+                            inter_phases.append(ph)
                     if inter_phases:
                         fail_to_success_phases.append(inter_phases)
-                        deduped = [p for i, p in enumerate(inter_phases) if i == 0 or p != inter_phases[i-1]]
+                        deduped = [p for j, p in enumerate(inter_phases) if j == 0 or p != inter_phases[j-1]]
                         fail_success_transitions[tuple(deduped)] += 1
 
             seen_edits.add(edit_key)
@@ -544,8 +628,6 @@ class TrajectoryGraphAnalyzer:
             fail_streaks.append(current_streak)
 
         # --- abandonment rule ---
-        # True iff ∃ file with ≥1 patch attempts and NO success on that file.
-        # This captures "all patches on some path (focused on that file) fail", even if other paths succeed.
         if any(file_attempts[p] > 0 and p not in file_has_success for p in file_attempts):
             abandonment = True
 
@@ -574,133 +656,5 @@ class TrajectoryGraphAnalyzer:
             "flip_flop": flip_flop,
             "repeat_failed_edit": repeat_failed_edit,
             "abandonment": abandonment,
-            "fail_to_success_patterns": fail_success_transitions.most_common(3),
+            "fail_to_success_patterns": fail_success_transitions.most_common(1),
         }
-
-
-# --------------------------- Main Analysis ---------------------------
-def graphs_analyzer(instance_dir):
-    out_dir = os.path.join(instance_dir, "analysis")
-    os.makedirs(out_dir, exist_ok=True)
-
-    difficulty_rename = {
-        "<15 min fix": "under15min",
-        "15 min - 1 hour": "under1h",
-        "1-4 hours": "under4h",
-        ">4 hours": "over4h"
-    }
-
-    categories = defaultdict(lambda: {
-        "phases": [],
-        "labels": [],
-        "metrics": [],
-        "localization": [],
-        "patches": [],
-        "freq_nodes": Counter(),
-        "loc_dominant_zone": [],
-        # "top_loc_info": [],
-        "start_actions": Counter()
-    })
-    rows = []
-
-    for root, _, files in os.walk(instance_dir):
-        for fname in files:
-            if not fname.endswith(".json"):
-                continue
-            with open(os.path.join(root, fname)) as f:
-                data = json.load(f)
-
-            analyzer = TrajectoryGraphAnalyzer(data)
-            step_label_pairs = analyzer.extract_step_label_pairs()
-
-            labels_seq = [lbl for _, lbl in step_label_pairs]
-            starting_label = next((lbl for lbl in labels_seq if lbl and lbl.strip().lower() != "empty action"), None)
-            starting_label = starting_label.split(":")[-1].strip() if starting_label else None
-
-            # resolution status for split counters
-            resolution = data.get("graph", {}).get("resolution_status", "unknown")
-
-            metrics = {}
-            debug_difficulty_raw = data.get("graph", {}).get("debug_difficulty", "unknown")
-            debug_difficulty = difficulty_rename.get(debug_difficulty_raw, debug_difficulty_raw)
-            golden_patch_difficulty = data.get("graph", {}).get("golden_patch_difficulty", "unknown")
-            patch_difficulty = data.get("graph", {}).get("patch_difficulty", "unknown")
-            files_changed_num = data.get("graph", {}).get("files_change", 0)
-            files_changed = (
-                "none" if files_changed_num == 0
-                else "single" if files_changed_num == 1
-                else "multiple"
-            )
-            inst_id = data.get("graph", {}).get("instance_name")
-            metrics.update({
-                "instance": inst_id,
-                "resolution": resolution,
-                "debug_difficulty": debug_difficulty,
-                "golden_patch_difficulty": golden_patch_difficulty,
-                "patch_difficulty": patch_difficulty,
-                "files_changed_num": files_changed_num,
-            })
-            metrics.update(analyzer.get_metric_dict())
-            localization_stats = analyzer.get_localization_summary()
-            patch_stats = analyzer.get_patch_summary()
-
-            flat_patch_stats = patch_stats.copy()
-            fs = flat_patch_stats.pop("fail_streaks", {})
-            flat_patch_stats["fail_streak_max"] = fs.get("max", 0)
-            flat_patch_stats["fail_streak_avg"] = fs.get("avg", 0)
-            flat_patch_stats["fail_streak_count"] = fs.get("count", 0)
-
-            fail_types = flat_patch_stats.pop("fail_types", {})
-            for kf, vf in fail_types.items():
-                flat_patch_stats[f"fail_type_{kf}"] = vf
-
-            for k in ["fail_to_success_patterns"]:
-                val = flat_patch_stats.get(k, [])
-                flat_patch_stats[k] = str(val[0][0]) if val else "N/A"
-
-            metrics.update(localization_stats)
-            metrics.update(flat_patch_stats)
-            rows.append(metrics)
-
-    df = pd.DataFrame(rows)
-    os.makedirs(out_dir, exist_ok=True)
-    df.to_csv(os.path.join(out_dir, "trajectory_metrics.csv"), index=False)
-
-def _usage_and_exit():
-    print("Usage: python analyze_graph.py <agent> <model> [config]\n"
-          "  agent: SWE-agent | OpenHands\n"
-          "  model: e.g., deepseek/deepseek-chat or openrouter/mistralai/devstral-small\n"
-          "  config (SWE-agent only, optional): default 'anthropic_filemap'",
-          file=sys.stderr)
-    sys.exit(1)
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3 or len(sys.argv) > 4:
-        _usage_and_exit()
-
-    agent = sys.argv[1]
-    model = sys.argv[2]
-
-    if agent == "SWE-agent":
-        config = sys.argv[3] if len(sys.argv) == 4 else "anthropic_filemap"
-        model_format = model.replace("/", "--")
-        graphs_dir = os.path.join(
-            os.path.dirname(__file__),
-            "../SWE-agent/graphs",
-            f"{config}__{model_format}__t-0.00__p-1.00__c-2.00___swe_bench_verified_test",
-        )
-
-    elif agent == "OpenHands":
-        model_name = model.split("/")[-1]
-        graphs_dir = os.path.join(
-            os.path.dirname(__file__),
-            "../OpenHands/graphs/",
-            "princeton-nlp__SWE-bench_Verified-test/CodeActAgent",
-            f"{model_name}_maxiter_100_N_v0.40.0-no-hint-run_1/",
-        )
-
-    else:
-        print("Error: agent must be 'SWE-agent' or 'OpenHands'.", file=sys.stderr)
-        _usage_and_exit()
-
-    graphs_analyzer(graphs_dir)
