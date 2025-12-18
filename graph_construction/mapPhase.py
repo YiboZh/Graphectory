@@ -36,7 +36,7 @@ TEST_HINTS: Tuple[str, ...] = (
 )
 
 # Commands that typically *read/search* only; with redirection they can become edits.
-READONLY_CMDS: Tuple[str, ...] = ("grep", "find", "cat", "echo", "ls", "head", "tail", "awk", "nl")
+READONLY_CMDS: Tuple[str, ...] = ("grep", "find", "cat", "ls", "head", "tail", "awk", "nl")
 
 # Commands that are clearly *editing* or *creating* content.
 EDIT_CMDS: Tuple[str, ...] = ("sed", "touch")
