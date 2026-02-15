@@ -2,39 +2,44 @@
 """
 Graph Generation Script for Agent Trajectories
 
-This script generates trajectory graphs (JSON + PDF) from agent execution traces.
+This script generates trajectory graphs (JSON + HTML) from agent execution traces.
 Supports SWE-agent and OpenHands trajectories across multiple models.
 
 Usage:
-    python graph_construction/generate_graphs.py --agent sa --model dsk-v3 --trajs path_to_your_trajectory_folder --eval_report path_to_your_report.json --output_dir data/samples
-    python graph_construction/generate_graphs.py --agent oh --model dsk-v3 --trajs path_to_your_output.jsonl --eval_report path_to_your_report.json --output_dir data/samples
+    python generate_graphs.py --agent sa --model dsk-v3 --trajs path/to/trajs --eval_report report.json --output_dir output --comment "Model: DeepSeek-V3, Plan: ReAct"
+    python generate_graphs.py --agent oh --model cld-4 --trajs output.jsonl --eval_report report.json --output_dir output --aggregate_htmls true --comment "Model: Claude-4"
 
 Output Structure:
-    {output_dir}/SWE-agent/graphs/{model}/{instance_id}/{instance_id}.{json,pdf}
-    {output_dir}/OpenHands/graphs/{model}/{instance_id}/{instance_id}.{json,pdf}
+    {output_dir}/SWE-agent/graphs/{model}/{instance_id}/{instance_id}.{json,html}
+    {output_dir}/OpenHands/graphs/{model}/{instance_id}/{instance_id}.{json,html}
+    {output_dir}/temp/*.html  (if --aggregate_htmls true)
 """
 
 import argparse
 import json
 import sys
+import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
-from commandParser import CommandParser
-from buildGraph import build_graph_from_sa_trajectory, build_graph_from_oh_trajectory
+# These imports will need to be adjusted based on your actual module structure
+# from commandParser import CommandParser
+# from buildGraph import build_graph_from_sa_trajectory, build_graph_from_oh_trajectory
 
 
 # ==================== Configuration ====================
 SUPPORTED_AGENTS = {"sa", "oh"}
-SUPPORTED_MODELS = {"dsk-v3", "dsk-r1", "dev", "cld-4"}
+SUPPORTED_MODELS = {"dsk-v3", "dsk-r1", "dev", "cld-4", "gpt-5m", "dsk-v3.2"}
 
 MODEL_NAMES = {
     "dsk-v3": "deepseek-v3",
     "dsk-r1": "deepseek-r1-0528",
     "dev": "devstral-small",
-    "cld-4": "claude-sonnet-4"
+    "cld-4": "claude-sonnet-4",
+    "gpt-5m": "gpt5-mini",
+    "dsk-v3.2": "deepseek-v3.2"
 }
 
 AGENT_NAMES = {
@@ -50,28 +55,15 @@ class ProcessingResult:
     instance_id: str
     status: str  # "success" or "error"
     json_path: Optional[str] = None
-    pdf_path: Optional[str] = None
+    html_path: Optional[str] = None
     error: Optional[str] = None
 
 
 # ==================== Path Management ====================
 def get_graph_output_dir(base_output_dir: str, agent: str, model: str) -> Path:
-    """Construct the graph output directory path.
-
-    Args:
-        base_output_dir: Base output directory
-        agent: Agent type (sa/oh)
-        model: Model type (dsk-v3/dsk-r1/dev/cld-4)
-
-    Returns:
-        Path to graph output directory
-
-    Structure:
-        {base_output_dir}/{AgentName}/graphs/{model_name}/
-    """
+    """Construct the graph output directory path."""
     agent_name = AGENT_NAMES[agent]
     model_name = MODEL_NAMES[model]
-
     return Path(base_output_dir) / agent_name / "graphs" / model_name
 
 
@@ -81,24 +73,7 @@ class TrajectoryLoader:
 
     @staticmethod
     def load_sa_trajectories(trajs_path: Path) -> List[Dict[str, Any]]:
-        """Load SWE-agent trajectories from directory structure.
-
-        Directory structure:
-            trajs_path/
-                ├── instance-1/
-                │   ├── instance-1.traj
-                │   └── instance-1.pred
-                ├── instance-2/
-                │   ├── instance-2.traj
-                │   └── instance-2.pred
-                └── ...
-
-        Args:
-            trajs_path: Path to trajectories directory
-
-        Returns:
-            List of trajectory dictionaries
-        """
+        """Load SWE-agent trajectories from directory structure."""
         trajectories = []
 
         if not trajs_path.is_dir():
@@ -127,16 +102,7 @@ class TrajectoryLoader:
 
     @staticmethod
     def load_oh_trajectories(trajs_path: Path) -> List[Dict[str, Any]]:
-        """Load OpenHands trajectories from output.jsonl file.
-
-        File format: JSONL with one trajectory per line, each containing 'instance_id' field
-
-        Args:
-            trajs_path: Path to output.jsonl file
-
-        Returns:
-            List of trajectory dictionaries
-        """
+        """Load OpenHands trajectories from output.jsonl file."""
         trajectories = []
 
         if not trajs_path.is_file():
@@ -168,47 +134,54 @@ class TrajectoryLoader:
 class GraphProcessor:
     """Process trajectories and generate graphs."""
 
-    def __init__(self, agent: str, parser: CommandParser, eval_report_path: str, output_dir: Path):
+    def __init__(self, agent: str, parser, eval_report_path: str, output_dir: Path, 
+                 temp_html_dir: Optional[Path] = None, metadata_comment: str = ""):
         self.agent = agent
         self.parser = parser
         self.eval_report_path = eval_report_path
         self.output_dir = output_dir
+        self.temp_html_dir = temp_html_dir
+        self.metadata_comment = metadata_comment
 
     def process_trajectory(self, instance_id: str, traj_data: Dict[str, Any]) -> ProcessingResult:
-        """Process a single trajectory and generate graph.
-
-        Args:
-            instance_id: Instance identifier
-            traj_data: Trajectory data dictionary
-
-        Returns:
-            ProcessingResult with status and paths
-        """
+        """Process a single trajectory and generate graph."""
         try:
+            # Import here to avoid circular dependencies
+            from buildGraph import build_graph_from_sa_trajectory, build_graph_from_oh_trajectory
+            
             if self.agent == "sa":
-                json_path, pdf_path = build_graph_from_sa_trajectory(
+                json_path, html_path = build_graph_from_sa_trajectory(
                     traj_data=traj_data,
                     parser=self.parser,
                     instance_id=instance_id,
                     output_dir=str(self.output_dir),
-                    eval_report_path=self.eval_report_path
+                    eval_report_path=self.eval_report_path,
+                    metadata_comment=self.metadata_comment
                 )
             elif self.agent == "oh":
-                json_path, pdf_path = build_graph_from_oh_trajectory(
+                json_path, html_path = build_graph_from_oh_trajectory(
                     traj_data=traj_data,
                     parser=self.parser,
                     instance_id=instance_id,
                     output_dir=str(self.output_dir),
-                    eval_report_path=self.eval_report_path
+                    eval_report_path=self.eval_report_path,
+                    metadata_comment=self.metadata_comment
                 )
             else:
                 raise ValueError(f"Unsupported agent: {self.agent}")
+
+            # Copy HTML to temp directory if specified
+            if self.temp_html_dir and html_path:
+                html_source = Path(html_path)
+                if html_source.exists():
+                    html_dest = self.temp_html_dir / html_source.name
+                    shutil.copy2(html_source, html_dest)
 
             return ProcessingResult(
                 instance_id=instance_id,
                 status="success",
                 json_path=json_path,
-                pdf_path=pdf_path
+                html_path=html_path
             )
 
         except Exception as e:
@@ -220,15 +193,9 @@ class GraphProcessor:
 
 
 # ==================== Main Functions ====================
-def setup_parser_for_agent(agent: str) -> CommandParser:
-    """Setup CommandParser with appropriate tool configurations.
-
-    Args:
-        agent: Agent type ("sa" or "oh")
-
-    Returns:
-        Configured CommandParser instance
-    """
+def setup_parser_for_agent(agent: str):
+    """Setup CommandParser with appropriate tool configurations."""
+    from commandParser import CommandParser
     parser = CommandParser()
 
     # Load tool configurations based on agent
@@ -255,16 +222,7 @@ def process_batch(
     processor: GraphProcessor,
     max_workers: int = 8
 ) -> Dict[str, List]:
-    """Process trajectories in parallel.
-
-    Args:
-        trajectories: List of trajectory dictionaries
-        processor: GraphProcessor instance
-        max_workers: Maximum number of parallel workers
-
-    Returns:
-        Dictionary with 'success' and 'failed' lists
-    """
+    """Process trajectories in parallel."""
     results = {"success": [], "failed": []}
 
     total = len(trajectories)
@@ -299,15 +257,9 @@ def process_batch(
     return results
 
 
-def print_summary(results: Dict[str, List], agent: str, model: str, output_dir: Path):
-    """Print processing summary.
-
-    Args:
-        results: Processing results dictionary
-        agent: Agent type
-        model: Model type
-        output_dir: Graph output directory path
-    """
+def print_summary(results: Dict[str, List], agent: str, model: str, output_dir: Path, 
+                 temp_html_dir: Optional[Path] = None, metadata_comment: str = ""):
+    """Print processing summary."""
     success_count = len(results["success"])
     failed_count = len(results["failed"])
     total = success_count + failed_count
@@ -318,7 +270,13 @@ def print_summary(results: Dict[str, List], agent: str, model: str, output_dir: 
     print(f"Agent:        {AGENT_NAMES[agent]}")
     print(f"Model:        {MODEL_NAMES[model]}")
     print(f"Output:       {output_dir}")
+    if temp_html_dir:
+        print(f"Temp HTMLs:   {temp_html_dir}")
+    if metadata_comment:
+        print(f"Comment:      {metadata_comment}")
     print(f"Total:        {total}")
+    print(f"Success:      {success_count}")
+    print(f"Failed:       {failed_count}")
     print(f"{'='*70}\n")
 
     if failed_count > 0:
@@ -338,17 +296,17 @@ def main():
         epilog="""
 Examples:
   # SWE-agent with DeepSeek-V3
-  python graph_construction/%(prog)s --agent sa --model dsk-v3 --trajs sa_trajectories --eval_report report.json --output_dir output
+  python %(prog)s --agent sa --model dsk-v3 --trajs sa_trajectories \\
+      --eval_report report.json --output_dir output \\
+      --comment "Model: DeepSeek-V3, Strategy: ReAct"
 
   # OpenHands with Claude Sonnet 4
-  python graph_construction/%(prog)s --agent oh --model cld-4 --trajs output.jsonl --eval_report report.json --output_dir output
+  python %(prog)s --agent oh --model cld-4 --trajs output.jsonl \\
+      --eval_report report.json --output_dir output --aggregate_htmls true \\
+      --comment "Model: Claude Sonnet 4, Strategy: Chain-of-Thought"
 
-Output Structure:
-  {output_dir}/SWE-agent/graphs/deepseek-v3/{instance_id}/{instance_id}.{json,pdf}
-  {output_dir}/OpenHands/graphs/claude-sonnet-4/{instance_id}/{instance_id}.{json,pdf}
-
-Supported agents: sa (SWE-agent), oh (OpenHands)
-Supported models: dsk-v3 (deepseek-v3), dsk-r1 (deepseek-r1-0528), dev (devstral-small), cld-4 (claude-sonnet-4)
+  # Start web server after generation
+  python graph_server.py --graphs_dir output/SWE-agent/graphs/deepseek-v3 --port 8000
         """
     )
 
@@ -365,7 +323,7 @@ Supported models: dsk-v3 (deepseek-v3), dsk-r1 (deepseek-r1-0528), dev (devstral
         type=str,
         required=True,
         choices=list(SUPPORTED_MODELS),
-        help="Model type: dsk-v3, dsk-r1, dev, or cld-4"
+        help="Model type"
     )
 
     parser.add_argument(
@@ -386,7 +344,22 @@ Supported models: dsk-v3 (deepseek-v3), dsk-r1 (deepseek-r1-0528), dev (devstral
         "--output_dir",
         type=str,
         required=True,
-        help="Base output directory (graphs will be organized by agent and model)"
+        help="Base output directory"
+    )
+
+    parser.add_argument(
+        "--aggregate_htmls",
+        type=str,
+        choices=["true", "false"],
+        default="false",
+        help="Copy all HTMLs to a 'temp' folder (default: false)"
+    )
+
+    parser.add_argument(
+        "--comment",
+        type=str,
+        default="",
+        help="Metadata comment to include in HTML files (e.g., 'Model: GPT-4, Plan: ReAct')"
     )
 
     parser.add_argument(
@@ -414,6 +387,12 @@ Supported models: dsk-v3 (deepseek-v3), dsk-r1 (deepseek-r1-0528), dev (devstral
     graph_output_dir = get_graph_output_dir(args.output_dir, args.agent, args.model)
     graph_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Setup temp HTML directory if aggregate_htmls is true
+    temp_html_dir = None
+    if args.aggregate_htmls == "true":
+        temp_html_dir = Path(args.output_dir) / "temp"
+        temp_html_dir.mkdir(parents=True, exist_ok=True)
+
     # Print configuration
     print(f"\n{'='*70}")
     print("CONFIGURATION")
@@ -423,6 +402,10 @@ Supported models: dsk-v3 (deepseek-v3), dsk-r1 (deepseek-r1-0528), dev (devstral
     print(f"Trajectories: {trajs_path}")
     print(f"Eval Report:  {eval_report_path}")
     print(f"Graph Output: {graph_output_dir}")
+    if temp_html_dir:
+        print(f"Temp HTMLs:   {temp_html_dir}")
+    if args.comment:
+        print(f"Comment:      {args.comment}")
     print(f"Workers:      {args.workers}")
     print(f"{'='*70}\n")
 
@@ -435,7 +418,6 @@ Supported models: dsk-v3 (deepseek-v3), dsk-r1 (deepseek-r1-0528), dev (devstral
             trajectories = TrajectoryLoader.load_oh_trajectories(trajs_path)
         else:
             print(f"[ERROR] Agent '{args.agent}' is not implemented yet")
-            print(f"Supported agents: {', '.join(SUPPORTED_AGENTS)}")
             sys.exit(1)
     except Exception as e:
         print(f"[ERROR] Failed to load trajectories: {e}")
@@ -455,14 +437,21 @@ Supported models: dsk-v3 (deepseek-v3), dsk-r1 (deepseek-r1-0528), dev (devstral
         agent=args.agent,
         parser=cmd_parser,
         eval_report_path=str(eval_report_path),
-        output_dir=graph_output_dir
+        output_dir=graph_output_dir,
+        temp_html_dir=temp_html_dir,
+        metadata_comment=args.comment
     )
 
     # Process trajectories
     results = process_batch(trajectories, processor, max_workers=args.workers)
 
     # Print summary
-    print_summary(results, args.agent, args.model, graph_output_dir)
+    print_summary(results, args.agent, args.model, graph_output_dir, temp_html_dir, args.comment)
+
+    # Suggest starting web server
+    if results["success"]:
+        print(f"💡 Tip: Start the web server to browse your graphs:")
+        print(f"   python graph_server.py --graphs_dir {graph_output_dir} --port 8000\n")
 
     # Exit with appropriate code
     if results["failed"]:
