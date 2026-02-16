@@ -236,21 +236,37 @@ class GraphVisualizer:
             display_label = self._make_simple_label(node_data)
             tooltip = self._build_tooltip(node_data)
             
+            # Check if this action failed
+            args = node_data.get("args", {})
+            has_failure = False
+            if isinstance(args, dict):
+                edit_status = args.get("edit_status", "")
+                if edit_status and str(edit_status).startswith("failure"):
+                    has_failure = True
+            
             nodes_data.append({
                 "id": node_id,
                 "label": display_label,
                 "tooltip": tooltip,
                 "color": primary_color,
-                "colors": colors
+                "colors": colors,
+                "has_failure": has_failure
             })
         
         return nodes_data
 
     def _prepare_edges_data(self, G: nx.MultiDiGraph) -> List[Dict[str, Any]]:
-        """Prepare edge data for JSON serialization with thought length information."""
+        """Prepare edge data for JSON serialization with thought length information.
+        
+        Key Logic:
+        - Each edge connects two nodes
+        - The edge's thought_length comes from the SOURCE node (the one doing the thinking)
+        - Multi-node steps are detected when multiple nodes share the same trajectory step_idx
+        - Edges between nodes in the same step get special blue dotted styling
+        """
         edges_data = []
         
-        # Build a map of step_idx -> nodes to detect multiple nodes per step
+        # Build map: step_idx -> list of node_ids in that step
         step_to_nodes = {}
         for node_id, node_data in G.nodes(data=True):
             step_indices = node_data.get("step_indices", [])
@@ -259,34 +275,47 @@ class GraphVisualizer:
                     step_to_nodes[step_idx] = []
                 step_to_nodes[step_idx].append(node_id)
         
+        # Process each edge
         for u, v, k, d in G.edges(keys=True, data=True):
             etype = d.get("type", "exec")
             edge_label = str(d.get("label", ""))
             
-            # For exec edges, get thought length from the target node's step
             thought_length = 0
             is_multi_node_step = False
             
-            if etype == "exec" and edge_label:
-                try:
-                    step_idx = int(edge_label)
-                    # Get thought length from target node
-                    v_data = G.nodes[v]
-                    thought_lengths = v_data.get("thought_lengths", [])
-                    step_indices = v_data.get("step_indices", [])
+            if etype == "exec":
+                # Get the source node's data
+                u_data = G.nodes[u]
+                u_step_indices = u_data.get("step_indices", [])
+                u_thought_lengths = u_data.get("thought_lengths", [])
+                
+                # Get the target node's data
+                v_data = G.nodes[v]
+                v_step_indices = v_data.get("step_indices", [])
+                
+                # Find common steps between source and target
+                common_steps = set(u_step_indices) & set(v_step_indices)
+                
+                if common_steps:
+                    # Nodes share the same trajectory step - this is a multi-node step
+                    is_multi_node_step = True
+                    # Use thought length of 0 for intra-step edges
+                    thought_length = 0
+                else:
+                    # Normal inter-step edge
+                    # Use the source node's thought length
+                    # The thought happens at the source node before transitioning to target
+                    if u_step_indices and u_thought_lengths:
+                        # Use the most recent (last) thought length from source node
+                        thought_length = u_thought_lengths[-1] if u_thought_lengths else 0
                     
-                    # Find thought length for this specific step
-                    if step_idx in step_indices:
-                        idx_pos = step_indices.index(step_idx)
-                        if idx_pos < len(thought_lengths):
-                            thought_length = thought_lengths[idx_pos]
-                    
-                    # Check if this step has multiple nodes
-                    if step_idx in step_to_nodes and len(step_to_nodes[step_idx]) > 1:
-                        is_multi_node_step = True
-                        
-                except (ValueError, KeyError):
-                    pass
+                    # Check if target node is part of a multi-node step
+                    # (This helps identify edges going into multi-node groups)
+                    if v_step_indices:
+                        last_v_step = v_step_indices[-1]
+                        if last_v_step in step_to_nodes and len(step_to_nodes[last_v_step]) > 1:
+                            # Don't mark as multi-node unless they're actually in the same step
+                            pass
             
             edges_data.append({
                 "from": u,

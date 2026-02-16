@@ -144,25 +144,45 @@ function createMarkers(svg) {
 
 // ==================== Edge Rendering ====================
 function calculateEdgeStyle(edge) {
-    let strokeWidth = 2;
-    let strokeDasharray = '';
-    let stroke = '#95a5a6';
+    /**
+     * Calculate edge styling based on thought length and multi-node status
+     * 
+     * Rules:
+     * - is_multi_node_step = true: Blue dotted line, minimum width (nodes in same step)
+     * - thought_length = 0: Gray dotted line, minimum width (no thinking)
+     * - thought_length > 0: Solid line, width scales 2-8px based on length (0-1000 chars)
+     */
+    let strokeWidth = 2;  // default
+    let strokeDasharray = '';  // solid by default
+    let stroke = '#95a5a6';  // default gray
     let markerEnd = 'url(#arrowhead-exec)';
     
     if (edge.type === 'exec') {
         if (edge.is_multi_node_step) {
+            // Multiple nodes in same trajectory step: blue dotted, minimum size
             strokeWidth = 1;
             strokeDasharray = '5, 5';
             stroke = '#3498db';
             markerEnd = 'url(#arrowhead-exec-multi)';
         } else if (edge.thought_length === 0) {
+            // No thought: gray dotted line, minimum size
             strokeWidth = 1;
             strokeDasharray = '5, 5';
+            stroke = '#95a5a6';
+            markerEnd = 'url(#arrowhead-exec)';
         } else {
-            const normalizedThought = Math.min(edge.thought_length, 1000);
-            strokeWidth = 2 + (normalizedThought / 1000) * 6;
+            // Normal exec edge with thought: solid line, width based on thought length
+            // Map thought_length (0-1000 chars) to stroke width (2-8px)
+            const maxThought = 1000;
+            const minWidth = 2;
+            const maxWidth = 8;
+            const normalizedThought = Math.min(edge.thought_length, maxThought);
+            strokeWidth = minWidth + (normalizedThought / maxThought) * (maxWidth - minWidth);
+            stroke = '#95a5a6';
+            markerEnd = 'url(#arrowhead-exec)';
         }
     } else if (edge.type === 'hier') {
+        // Hierarchical edge styling
         strokeWidth = 2;
         strokeDasharray = '5, 5';
         stroke = '#27ae60';
@@ -269,6 +289,13 @@ function renderNodes(svg, g, defs) {
             rect.setAttribute('width', node.width);
             rect.setAttribute('height', node.height);
             rect.setAttribute('fill', `url(#${gradId})`);
+            
+            // Add thick red border for failed actions
+            if (node.has_failure) {
+                rect.setAttribute('stroke', '#e74c3c');
+                rect.setAttribute('stroke-width', '4');
+            }
+            
             nodeGroup.appendChild(rect);
         } else {
             const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
@@ -277,6 +304,13 @@ function renderNodes(svg, g, defs) {
             rect.setAttribute('width', node.width);
             rect.setAttribute('height', node.height);
             rect.setAttribute('fill', node.color);
+            
+            // Add thick red border for failed actions
+            if (node.has_failure) {
+                rect.setAttribute('stroke', '#e74c3c');
+                rect.setAttribute('stroke-width', '4');
+            }
+            
             nodeGroup.appendChild(rect);
         }
         

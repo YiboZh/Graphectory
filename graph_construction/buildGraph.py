@@ -271,7 +271,6 @@ def build_graph_from_sa_trajectory(traj_data, parser, instance_id, output_dir, e
             builder.add_execution_edge(node_key, step_idx)
             builder.update_previous_node(node_key)
             builder.add_phase("general")
-            builder.track_thought(node_key, thought)
             continue
 
         # Parse actionable commands
