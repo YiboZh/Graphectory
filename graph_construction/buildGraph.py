@@ -82,7 +82,7 @@ class GraphBuilder:
         self.thought_history = []  # Track (node_key, thought_text) pairs
 
     def add_or_update_node(self, node_label, args, flags, phase, step_idx,
-                          tool=None, command=None, subcommand=None, thought_length=0):
+                          tool=None, command=None, subcommand=None, thought_length=0, has_cd=False):
         """Add a new node or update existing node with a new occurrence.
 
         Args:
@@ -95,6 +95,7 @@ class GraphBuilder:
             command: Command name (if applicable)
             subcommand: Subcommand name (if applicable)
             thought_length: Length of thought text for this step
+            has_cd: Whether this node had a cd command stripped
 
         Returns:
             node_key: The key of the added or updated node
@@ -109,6 +110,9 @@ class GraphBuilder:
             if "phases" not in self.G.nodes[node_key]:
                 self.G.nodes[node_key]["phases"] = []
             self.G.nodes[node_key]["phases"].append(phase)
+            # Update has_cd if this occurrence has cd
+            if has_cd:
+                self.G.nodes[node_key]["has_cd"] = True
         else:
             # Add new node
             node_key = f"{len(self.G.nodes)}:{node_label}"
@@ -122,7 +126,8 @@ class GraphBuilder:
                 thought_lengths=[thought_length],
                 tool=tool,
                 command=command,
-                subcommand=subcommand
+                subcommand=subcommand,
+                has_cd=has_cd
             )
             self.node_signature_to_key[node_signature] = node_key
 
@@ -132,15 +137,22 @@ class GraphBuilder:
 
         return node_key
 
-    def add_execution_edge(self, node_key, step_idx):
+    def add_execution_edge(self, node_key, step_idx, is_first_in_step=False):
         """Add execution edge from previous node to current node.
 
         Args:
             node_key: Target node key
             step_idx: Step index for edge label
+            is_first_in_step: Whether this is the first edge in this trajectory step
         """
         if self.previous_node:
-            self.G.add_edge(self.previous_node, node_key, label=str(step_idx), type="exec")
+            self.G.add_edge(
+                self.previous_node, 
+                node_key, 
+                label=str(step_idx), 
+                type="exec",
+                is_first_in_step=is_first_in_step
+            )
 
     def update_previous_node(self, node_key):
         """Update the previous node pointer.
@@ -278,7 +290,27 @@ def build_graph_from_sa_trajectory(traj_data, parser, instance_id, output_dir, e
         if not parsed_commands:
             continue
 
-        for parsed in parsed_commands:
+        # Filter out cd commands if there are other commands in the same step
+        # and mark remaining nodes as having cd prefix
+        has_cd = False
+        filtered_commands = []
+        
+        if len(parsed_commands) > 1:
+            # Check if first command is cd
+            first_cmd = parsed_commands[0]
+            if first_cmd.get("command", "").strip().lower() == "cd":
+                has_cd = True
+                # Skip the cd command, process the rest
+                filtered_commands = parsed_commands[1:]
+            else:
+                filtered_commands = parsed_commands
+        else:
+            filtered_commands = parsed_commands
+        
+        # Track if this is the first node in this trajectory step
+        is_first_in_step = True
+        
+        for parsed in filtered_commands:
             tool = parsed.get("tool", "").strip() if parsed.get("tool") else ""
             subcommand = parsed.get("subcommand", "").strip() if parsed.get("subcommand") else ""
             command = parsed.get("command", "").strip() if parsed.get("command") else ""
@@ -305,11 +337,17 @@ def build_graph_from_sa_trajectory(traj_data, parser, instance_id, output_dir, e
                 tool=tool,
                 command=command,
                 subcommand=subcommand,
-                thought_length=thought_length
+                thought_length=thought_length,
+                has_cd=has_cd  # Mark if cd was stripped
             )
-            builder.add_execution_edge(node_key, step_idx)
+            
+            # Add edge - first edge in step gets thought length assigned
+            builder.add_execution_edge(node_key, step_idx, is_first_in_step=is_first_in_step)
             builder.update_previous_node(node_key)
             builder.add_phase(phase)
+            
+            # After first node, subsequent nodes in same step are not "first"
+            is_first_in_step = False
 
     return builder.finalize_and_save(output_dir, instance_id, eval_report_path, template_dir, metadata_comment)
 
@@ -390,7 +428,23 @@ def build_graph_from_oh_trajectory(traj_data, parser, instance_id, output_dir, e
         if not parsed_commands:
             continue
 
-        for parsed in parsed_commands:
+        # Filter out cd commands if there are other commands in the same step
+        has_cd = False
+        filtered_commands = []
+        
+        if len(parsed_commands) > 1:
+            first_cmd = parsed_commands[0]
+            if first_cmd.get("command", "").strip().lower() == "cd":
+                has_cd = True
+                filtered_commands = parsed_commands[1:]
+            else:
+                filtered_commands = parsed_commands
+        else:
+            filtered_commands = parsed_commands
+        
+        is_first_in_step = True
+
+        for parsed in filtered_commands:
             tool = parsed.get("tool", "").strip()
             
             # ---- THINK NODES ----
@@ -406,10 +460,10 @@ def build_graph_from_oh_trajectory(traj_data, parser, instance_id, output_dir, e
                     subcommand=None,
                     thought_length=thought_length
                 )
-                builder.add_execution_edge(node_key, step_idx)
+                builder.add_execution_edge(node_key, step_idx, is_first_in_step=is_first_in_step)
                 builder.update_previous_node(node_key)
                 builder.add_phase("general")
-                builder.track_thought(node_key, thought)
+                is_first_in_step = False
                 continue
 
             subcommand = parsed.get("subcommand", "").strip() if parsed.get("subcommand") else ""
@@ -437,11 +491,13 @@ def build_graph_from_oh_trajectory(traj_data, parser, instance_id, output_dir, e
                 tool=tool,
                 command=command,
                 subcommand=subcommand,
-                thought_length=thought_length
+                thought_length=thought_length,
+                has_cd=has_cd
             )
-            builder.add_execution_edge(node_key, step_idx)
+            builder.add_execution_edge(node_key, step_idx, is_first_in_step=is_first_in_step)
             builder.update_previous_node(node_key)
             builder.add_phase(phase)
+            is_first_in_step = False
 
         step_idx += 1
 

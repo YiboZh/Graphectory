@@ -314,6 +314,24 @@ function renderNodes(svg, g, defs) {
             nodeGroup.appendChild(rect);
         }
         
+        // Add triangular "hat" for nodes that had cd command stripped
+        if (node.has_cd) {
+            const hatSize = 12;
+            const topY = node.y - node.height / 2;
+            const centerX = node.x;
+            
+            const triangle = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            const d = `M ${centerX} ${topY - hatSize} ` +
+                     `L ${centerX - hatSize} ${topY} ` +
+                     `L ${centerX + hatSize} ${topY} Z`;
+            triangle.setAttribute('d', d);
+            triangle.setAttribute('fill', '#f39c12');  // Orange color for cd indicator
+            triangle.setAttribute('stroke', '#e67e22');
+            triangle.setAttribute('stroke-width', '1.5');
+            
+            nodeGroup.appendChild(triangle);
+        }
+        
         const lines = node.label.split('\\n');
         const lineHeight = 16;
         const totalTextHeight = lines.length * lineHeight;

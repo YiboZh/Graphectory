@@ -253,6 +253,15 @@ svg {
     flex-shrink: 0;
 }
 
+.legend-symbol {
+    width: 32px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
 .legend-label {
     color: #34495e;
     font-weight: 500;

@@ -244,13 +244,17 @@ class GraphVisualizer:
                 if edit_status and str(edit_status).startswith("failure"):
                     has_failure = True
             
+            # Check if this node had cd stripped
+            has_cd = node_data.get("has_cd", False)
+            
             nodes_data.append({
                 "id": node_id,
                 "label": display_label,
                 "tooltip": tooltip,
                 "color": primary_color,
                 "colors": colors,
-                "has_failure": has_failure
+                "has_failure": has_failure,
+                "has_cd": has_cd
             })
         
         return nodes_data
@@ -260,7 +264,8 @@ class GraphVisualizer:
         
         Key Logic:
         - Each edge connects two nodes
-        - The edge's thought_length comes from the SOURCE node (the one doing the thinking)
+        - Only the FIRST edge in a trajectory step gets the thought_length
+        - Subsequent edges in same step get thought_length=0
         - Multi-node steps are detected when multiple nodes share the same trajectory step_idx
         - Edges between nodes in the same step get special blue dotted styling
         """
@@ -279,6 +284,7 @@ class GraphVisualizer:
         for u, v, k, d in G.edges(keys=True, data=True):
             etype = d.get("type", "exec")
             edge_label = str(d.get("label", ""))
+            is_first_in_step = d.get("is_first_in_step", False)
             
             thought_length = 0
             is_multi_node_step = False
@@ -299,23 +305,19 @@ class GraphVisualizer:
                 if common_steps:
                     # Nodes share the same trajectory step - this is a multi-node step
                     is_multi_node_step = True
-                    # Use thought length of 0 for intra-step edges
+                    # Intra-step edges always have thought_length = 0
                     thought_length = 0
                 else:
                     # Normal inter-step edge
-                    # Use the source node's thought length
-                    # The thought happens at the source node before transitioning to target
-                    if u_step_indices and u_thought_lengths:
-                        # Use the most recent (last) thought length from source node
-                        thought_length = u_thought_lengths[-1] if u_thought_lengths else 0
-                    
-                    # Check if target node is part of a multi-node step
-                    # (This helps identify edges going into multi-node groups)
-                    if v_step_indices:
-                        last_v_step = v_step_indices[-1]
-                        if last_v_step in step_to_nodes and len(step_to_nodes[last_v_step]) > 1:
-                            # Don't mark as multi-node unless they're actually in the same step
-                            pass
+                    # Only the FIRST edge in a trajectory step gets the thought length
+                    if is_first_in_step:
+                        # Use the source node's thought length
+                        if u_step_indices and u_thought_lengths:
+                            # Use the most recent (last) thought length from source node
+                            thought_length = u_thought_lengths[-1] if u_thought_lengths else 0
+                    else:
+                        # Not the first edge in step - no thought visualization
+                        thought_length = 0
             
             edges_data.append({
                 "from": u,
@@ -323,7 +325,8 @@ class GraphVisualizer:
                 "type": etype,
                 "label": edge_label if etype == "exec" else "",
                 "thought_length": thought_length,
-                "is_multi_node_step": is_multi_node_step
+                "is_multi_node_step": is_multi_node_step,
+                "is_first_in_step": is_first_in_step
             })
         
         return edges_data
