@@ -61,7 +61,7 @@ function layoutGraph() {
     maxX += padding;
     maxY += padding;
     
-    // CRITICAL FIX: Normalize coordinates to start at (0, 0)
+    // Normalize coordinates to start at (0, 0)
     const offsetX = -minX;
     const offsetY = -minY;
     
@@ -161,10 +161,10 @@ function getThoughtLength(edge) {
 
 function thoughtToWidth(thoughtLength) {
     if (thoughtLength <= 0) return 1;
-    const capped = Math.min(thoughtLength, 1500);
-    if (capped <= 200)  return 1.5 + (capped / 200) * 1.5;
-    if (capped <= 800)  return 3   + ((capped - 200) / 600) * 3;
-    return 6 + ((capped - 800) / 700) * 3;
+    const capped = Math.min(thoughtLength, 5000);
+    if (capped <= 200)  return 6 + (capped / 200) * 6;
+    if (capped <= 800)  return 12   + ((capped - 200) / 600) * 12;
+    return 24 + ((capped - 800) / 700) * 12;
 }
 
 function calculateEdgeStyle(edge) {
@@ -400,7 +400,7 @@ function renderNodes(svg, g, defs) {
 
         // Add observation indicator rectangle (if enabled and node has observation)
         if (settings.showObservation && node.observation_length > 0) {
-            const obsWidth = Math.min(Math.max(node.observation_length / 50, 3), 12);
+            const obsWidth = Math.min(Math.max(node.observation_length / 50, 5), 50);
             const obsHeight = node.height * 0.7;
             const rightX = node.x + node.width / 2;
             const centerY = node.y;
