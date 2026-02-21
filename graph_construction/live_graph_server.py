@@ -13,6 +13,7 @@ Use the toggle in the sidebar to switch between cd-filtered (▲ hat) and
 cd-as-separate-node mode in real time.
 """
 
+from commandParser import CommandParser
 import argparse
 import sys
 from http.server import HTTPServer
@@ -53,23 +54,6 @@ Examples
     return p.parse_args()
 
 
-def setup_cmd_parser():
-    """Return a bare CommandParser instance.
-
-    Tool configs are discovered per-instance from the trajectory folder
-    ({graphs_dir}/{instance_id}/{instance_id}.config.yaml) and loaded
-    at request time in graph_builder.build_graph().
-
-    Raises SystemExit if commandParser cannot be imported.
-    """
-    try:
-        from graph_construction.commandParser import CommandParser
-        return CommandParser()
-    except ImportError:
-        print("[ERROR] commandParser module not found – cannot continue.")
-        sys.exit(1)
-
-
 def main() -> int:
     args = parse_args()
 
@@ -91,7 +75,7 @@ def main() -> int:
     # Inject configuration into the handler class
     GraphHandler.graphs_dir       = graphs_dir
     GraphHandler.eval_report_path = str(eval_report)
-    GraphHandler.cmd_parser       = setup_cmd_parser()
+    GraphHandler.cmd_parser       = CommandParser()
     GraphHandler.assets_dir       = assets_dir
 
     httpd = HTTPServer(("", args.port), GraphHandler)
