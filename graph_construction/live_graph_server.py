@@ -13,7 +13,6 @@ Use the toggle in the sidebar to switch between cd-filtered (▲ hat) and
 cd-as-separate-node mode in real time.
 """
 
-from commandParser import CommandParser
 import argparse
 import sys
 from http.server import HTTPServer
@@ -54,6 +53,41 @@ Examples
     return p.parse_args()
 
 
+def setup_cmd_parser():
+    """Return a CommandParser loaded with all available SWE-agent tool configs.
+
+    Each config file defines a distinct set of tools (editor, reviewer, registry),
+    so all present configs are loaded — not just the first one found.
+    Returns None only if commandParser cannot be imported.
+    """
+    try:
+        from commandParser import CommandParser
+        parser = CommandParser()
+
+        tool_configs = [
+            "data/SWE-agent/tools/edit_anthropic/config.yaml",
+            "data/SWE-agent/tools/review_on_submit_m/config.yaml",
+            "data/SWE-agent/tools/registry/config.yaml",
+        ]
+        loaded = []
+        for cfg in tool_configs:
+            cfg_path = Path(cfg)
+            if cfg_path.exists():
+                parser.load_tool_yaml_files([str(cfg_path)])
+                loaded.append(cfg_path.name)
+
+        if loaded:
+            print(f"  [parser] Loaded tool configs: {', '.join(loaded)}")
+        else:
+            print("  [parser] No tool config YAMLs found – parser has no tool definitions")
+
+        return parser
+
+    except ImportError:
+        print("[WARN] commandParser not found – install it or add it to the Python path")
+        return None
+
+
 def main() -> int:
     args = parse_args()
 
@@ -75,7 +109,7 @@ def main() -> int:
     # Inject configuration into the handler class
     GraphHandler.graphs_dir       = graphs_dir
     GraphHandler.eval_report_path = str(eval_report)
-    GraphHandler.cmd_parser       = CommandParser()
+    GraphHandler.cmd_parser       = setup_cmd_parser()
     GraphHandler.assets_dir       = assets_dir
 
     httpd = HTTPServer(("", args.port), GraphHandler)
@@ -86,8 +120,6 @@ def main() -> int:
     print(f"  Graphs dir   : {graphs_dir.absolute()}")
     print(f"  Eval report  : {eval_report.absolute()}")
     print(f"  Assets dir   : {assets_dir.absolute()}")
-    print(f"  Tool configs : auto-discovered from each instance folder")
-    print(f"                 (<graphs_dir>/<id>/<id>.config.yaml)")
     print(f"  URL          : http://localhost:{args.port}")
     print(f"{'─'*60}\n")
     print("  Press Ctrl+C to stop.\n")
