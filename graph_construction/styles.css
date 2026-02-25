@@ -94,7 +94,7 @@ h1 {
     flex-wrap: wrap;
 }
 
-button {
+.controls button {
     padding: 10px 20px;
     border: none;
     border-radius: 8px;
@@ -106,12 +106,12 @@ button {
     transition: transform 0.2s, box-shadow 0.2s;
 }
 
-button:hover {
+.controls button:hover {
     transform: translateY(-2px);
     box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
 }
 
-button:active {
+.controls button:active {
     transform: translateY(0);
 }
 
@@ -121,11 +121,18 @@ button:active {
     box-shadow: 0 4px 6px rgba(0,0,0,0.1);
     overflow: hidden;
     position: relative;
+    /* Flex layout so sidebar sits alongside the graph */
+    display: flex;
+    align-items: stretch;
+    /* Explicit height: sidebar and graph are clamped to this, nothing can blow it out */
+    height: 900px;
 }
 
 #graph {
-    width: 100%;
-    height: 900px;
+    /* Fill available width; height comes from the container */
+    flex: 1;
+    min-width: 0;
+    height: 100%;
     overflow: hidden;
     position: relative;
     background: #fafafa;
@@ -163,22 +170,7 @@ svg {
 
 .edge path {
     fill: none;
-    stroke-width: 2;
-}
-
-.edge.exec path {
-    stroke: #95a5a6;
-}
-
-.edge.hier path {
-    stroke: #27ae60;
-    stroke-dasharray: 5, 5;
-}
-
-.edge.thought path {
-    stroke: #e74c3c;
-    stroke-width: 3;
-    stroke-dasharray: 8, 4;
+    /* stroke and stroke-width are set entirely by JS — no CSS override here */
 }
 
 .edge text {
@@ -267,31 +259,24 @@ svg {
 }
 /* ==================== Detail Sidebar ==================== */
 
-.graph-container {
-    position: relative;
-    display: flex;
-    align-items: stretch;
-}
-
-#graph {
-    flex: 1;
-    min-width: 0;
-    transition: width 0.25s ease;
-}
-
 /* Sidebar panel */
 .detail-sidebar {
+    /* Always display:flex so toggling width never triggers a display recalculation
+       that can cause the page to momentarily expand or the legend to jump. */
+    display: flex;
+    flex-direction: column;
     width: 0;
     flex-shrink: 0;
-    overflow: hidden;
+    overflow: hidden;           /* hides content when width is 0 */
     background: #1a1f2e;
     border-left: none;
     border-radius: 0 12px 12px 0;
-    display: flex;
-    flex-direction: column;
-    transition: width 0.25s ease, border-left 0.25s ease;
+    transition: width 0.22s ease, border-left 0.22s ease;
     position: relative;
     z-index: 20;
+    height: 100%;               /* fills graph-container, never breaks out of it */
+    min-height: 0;              /* prevents flex children from inflating this */
+    box-sizing: border-box;
 }
 
 .detail-sidebar.open {
@@ -386,6 +371,7 @@ svg {
 /* Scrollable content area */
 .sidebar-content {
     flex: 1;
+    min-height: 0;      /* required: lets flex shrink below content's intrinsic height */
     overflow-y: auto;
     padding: 0;
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
@@ -471,3 +457,40 @@ svg {
 }
 .outcome-pill.success { background: #1a4a2a; color: #4ade80; }
 .outcome-pill.failure { background: #4a1a1a; color: #ff8080; }
+
+/* ── Fullscreen mode ────────────────────────────────────────────────────── */
+/* When the whole document is fullscreened we force the graph-container to  */
+/* cover the entire viewport so there's no offset or leftover page chrome.  */
+.graph-container.fullscreen-active {
+    position: fixed;
+    inset: 0;               /* top/right/bottom/left: 0 */
+    z-index: 9999;
+    border-radius: 0;
+    margin: 0;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+}
+
+/* #graph must fill its container in fullscreen */
+.graph-container.fullscreen-active #graph {
+    height: 100%;
+}
+
+/* ── Sidebar resizer handle ─────────────────────────────────────────────── */
+.sidebar-resizer {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 30;
+    background: transparent;
+    transition: background 0.15s;
+}
+
+.sidebar-resizer:hover,
+.sidebar-resizer:active {
+    background: rgba(100, 130, 220, 0.35);
+}

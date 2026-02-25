@@ -12,6 +12,14 @@ The public surface is a single function:
 import json
 import os
 from pathlib import Path
+
+
+def _safe_json(obj) -> str:
+    """Serialize obj to JSON, escaping '</' so observation text containing
+    '</script>' cannot terminate the surrounding <script> tag in the HTML.
+    This is the standard technique for embedding JSON in HTML script blocks.
+    """
+    return json.dumps(obj).replace('</', r'<\/')
 from typing import Any
 
 import networkx as nx
@@ -67,10 +75,10 @@ def render_graph_html(G: nx.MultiDiGraph, filter_cd: bool,
     html = html.replace("{{METADATA_COMMENT}}",  _esc(meta["metadata_comment"]))
 
     # Data substitutions
-    html = html.replace("{{NODES_DATA}}",   json.dumps(nodes_data))
-    html = html.replace("{{EDGES_DATA}}",   json.dumps(edges_data))
-    html = html.replace("{{PHASE_COLORS}}", json.dumps(PHASE_COLORS))
-    html = html.replace("{{SETTINGS}}",     json.dumps(settings))
+    html = html.replace("{{NODES_DATA}}",   _safe_json(nodes_data))
+    html = html.replace("{{EDGES_DATA}}",   _safe_json(edges_data))
+    html = html.replace("{{PHASE_COLORS}}", _safe_json(PHASE_COLORS))
+    html = html.replace("{{SETTINGS}}",     _safe_json(settings))
 
     # Inline CSS and JS so the response is fully self-contained
     html = html.replace(
@@ -93,18 +101,10 @@ def _prepare_nodes(G: nx.MultiDiGraph) -> list[dict[str, Any]]:
         colors        = _node_colors(data)
         primary_color = colors[0] if colors else PHASE_COLORS["general"]
 
-        args             = data.get("args", {}) or {}
-        edit_status      = args.get("edit_status",     "") if isinstance(args, dict) else ""
-        command_outcome  = args.get("command_outcome", "") if isinstance(args, dict) else ""
-        has_failure = bool(
-            (edit_status     and str(edit_status).startswith("failure")) or
-            (command_outcome and str(command_outcome).startswith("failure"))
-        )
         has_cd = bool(data.get("has_cd", False))
 
         # Observation data (for last node of each step)
         obs_length = data.get("observation_length", 0)
-        obs_outcome = data.get("observation_outcome", "neutral")
 
         nodes.append({
             "id":                  node_id,
@@ -113,10 +113,8 @@ def _prepare_nodes(G: nx.MultiDiGraph) -> list[dict[str, Any]]:
             "tooltip":             _make_tooltip(data),
             "color":               primary_color,
             "colors":              colors,
-            "has_failure":         has_failure,
             "has_cd":              has_cd,
             "observation_length":  obs_length,
-            "observation_outcome": obs_outcome,
             "tool":                data.get("tool", ""),
             "subcommand":          data.get("subcommand", ""),
             "step_data":           data.get("step_data", []),
@@ -338,12 +336,10 @@ def _make_tooltip(data: dict) -> str:
             )
 
     # ── Observation section ──────────────────────────────────────────────────
-    obs_lengths  = data.get("observation_lengths",  [])   # per-step list (may be absent on older nodes)
-    obs_length   = data.get("observation_length",   0)    # scalar fallback (last step only)
-    obs_outcome  = data.get("observation_outcome",  "neutral")
+    obs_lengths = data.get("observation_lengths", [])
+    obs_length  = data.get("observation_length",  0)
 
     if obs_lengths and len(obs_lengths) > 1:
-        obs_color = {"success": "#7defa7", "failure": "#ff8080"}.get(obs_outcome, "#a0c4ff")
         items_html = "".join(
             f'<div style="margin-left:8px;">#{i+1}: {ol}</div>'
             for i, ol in enumerate(obs_lengths)
@@ -354,21 +350,8 @@ def _make_tooltip(data: dict) -> str:
             f'<span style="word-break:break-all;">{items_html}</span>'
             f'</div>'
         )
-        parts.append(
-            f'<div style="display:flex;gap:8px;margin:2px 0;">'
-            f'<span style="color:#a0c4ff;min-width:110px;flex-shrink:0;">Obs. status</span>'
-            f'<span style="color:{obs_color};font-weight:600;">{_esc(obs_outcome)}</span>'
-            f'</div>'
-        )
     elif obs_length:
-        obs_color = {"success": "#7defa7", "failure": "#ff8080"}.get(obs_outcome, "#a0c4ff")
         parts.append(_row("Observation len", str(obs_length)))
-        parts.append(
-            f'<div style="display:flex;gap:8px;margin:2px 0;">'
-            f'<span style="color:#a0c4ff;min-width:110px;flex-shrink:0;">Obs. status</span>'
-            f'<span style="color:{obs_color};font-weight:600;">{_esc(obs_outcome)}</span>'
-            f'</div>'
-        )
 
     # ── Outcome (shown before arguments for visibility) ──────────────────────
     args = data.get("args", {}) or {}
@@ -435,11 +418,20 @@ def _prepare_edges(G: nx.MultiDiGraph) -> list[dict[str, Any]]:
             v_steps = set(G.nodes[v].get("step_indices", []))
             is_multi_node = bool(u_steps & v_steps) and not is_first_in_step
             is_thought_continuation = bool(d.get("is_thought_continuation", False))
+
+            # For first-in-step edges, carry the source node's observation
+            # length so the edge body thickness can encode it.
+            if is_first_in_step:
+                src_data   = G.nodes[u]
+                obs_length = int(src_data.get("observation_length", 0))
+            else:
+                obs_length = 0
         else:
-            thought_len_raw          = 0
-            thought_len_clean        = 0
-            is_multi_node            = False
-            is_thought_continuation  = False
+            thought_len_raw         = 0
+            thought_len_clean       = 0
+            is_multi_node           = False
+            is_thought_continuation = False
+            obs_length              = 0
 
         edges.append({
             "from":                    u,
@@ -451,6 +443,7 @@ def _prepare_edges(G: nx.MultiDiGraph) -> list[dict[str, Any]]:
             "is_multi_node_step":      is_multi_node,
             "is_first_in_step":        is_first_in_step,
             "is_thought_continuation": is_thought_continuation,
+            "obs_length":              obs_length,
         })
 
     return edges

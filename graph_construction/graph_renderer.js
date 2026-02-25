@@ -270,6 +270,54 @@ function pointsToPath(points, offsetY) {
     return d;
 }
 
+/**
+ * Map observation length to a body stroke-width.
+ * The body thickness encodes how long the previous step's observation was.
+ * Range: 1 (empty) → ~18 (very long), matching the thoughtToWidth scale.
+ */
+function obsLengthToWidth(obsLength) {
+    if (!obsLength || obsLength <= 0) return 1;
+    const capped = Math.min(obsLength, 8000);
+    if (capped <= 500)  return 1  + (capped / 500) * 5;
+    if (capped <= 2000) return 6  + ((capped - 500)  / 1500) * 8;
+    return 14 + ((capped - 2000) / 6000) * 4;
+}
+
+/**
+ * Return {x, y} at fraction t (0–1) of the polyline's total arc length.
+ * offsetY is added to all y values before computing distances.
+ */
+function interpOnPath(points, t, offsetY) {
+    if (!points || points.length === 0) return { x: 0, y: 0 };
+    if (points.length === 1) return { x: points[0].x, y: points[0].y + offsetY };
+
+    // Cumulative arc lengths
+    const segs = [];
+    let total = 0;
+    for (let i = 1; i < points.length; i++) {
+        const dx = points[i].x - points[i-1].x;
+        const dy = (points[i].y + offsetY) - (points[i-1].y + offsetY);
+        const len = Math.sqrt(dx*dx + dy*dy);
+        segs.push(len);
+        total += len;
+    }
+
+    const target = t * total;
+    let acc = 0;
+    for (let i = 0; i < segs.length; i++) {
+        if (acc + segs[i] >= target) {
+            const frac = segs[i] > 0 ? (target - acc) / segs[i] : 0;
+            return {
+                x: points[i].x   + frac * (points[i+1].x - points[i].x),
+                y: (points[i].y + offsetY) + frac * ((points[i+1].y + offsetY) - (points[i].y + offsetY)),
+            };
+        }
+        acc += segs[i];
+    }
+    const last = points[points.length - 1];
+    return { x: last.x, y: last.y + offsetY };
+}
+
 function renderEdges(svg, g, defs) {
     // Pre-compute edge counts per (from,to) pair for multi-edge offsetting
     const edgesByPair = {};
@@ -279,19 +327,11 @@ function renderEdges(svg, g, defs) {
         edgesByPair[key].push({ ...edge, idx });
     });
 
-    // Create per-width arrowhead markers (so marker scales with line thickness)
-    const widthsSeen = new Set();
-    edgesData.forEach(edge => {
-        if (edge.type === 'exec' && !edge.is_multi_node_step) {
-            const tlen = getThoughtLength(edge);
-            if (tlen > 0) {
-                widthsSeen.add(Math.round(thoughtToWidth(tlen)));
-            }
-        }
-    });
-    widthsSeen.forEach(w => {
+    // Create per-width arrowhead markers for thought length (marker-end)
+    // and observation length (marker-mid, same shape, independent size).
+    function makeArrowMarker(id, w, color) {
         const m = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-        m.setAttribute('id', `arrowhead-exec-w${w}`);
+        m.setAttribute('id', id);
         m.setAttribute('markerWidth',  String(6 + w));
         m.setAttribute('markerHeight', String(6 + w));
         m.setAttribute('refX', String(5 + w));
@@ -299,10 +339,28 @@ function renderEdges(svg, g, defs) {
         m.setAttribute('orient', 'auto');
         const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         p.setAttribute('d', `M0,0 L0,${4 + w} L${5 + w},${(4 + w) / 2} z`);
-        p.setAttribute('fill', '#7f8c8d');
+        p.setAttribute('fill', color);
         m.appendChild(p);
         defs.appendChild(m);
+    }
+
+    // Collect all distinct thought widths (for marker-end)
+    const thoughtWidthsSeen = new Set();
+    // Collect all distinct obs widths (for marker-mid)
+    const obsWidthsSeen = new Set();
+
+    edgesData.forEach(edge => {
+        if (edge.type === 'exec' && !edge.is_multi_node_step && !edge.is_thought_continuation) {
+            const tlen = getThoughtLength(edge);
+            if (tlen > 0) thoughtWidthsSeen.add(Math.round(thoughtToWidth(tlen)));
+        }
+        if (settings.showObservation && edge.is_first_in_step && edge.obs_length > 0) {
+            obsWidthsSeen.add(Math.round(obsLengthToWidth(edge.obs_length)));
+        }
     });
+
+    thoughtWidthsSeen.forEach(w => makeArrowMarker(`arrowhead-exec-w${w}`,     w, '#7f8c8d'));
+    obsWidthsSeen.forEach(w     => makeArrowMarker(`arrowhead-obs-w${w}`,        w, '#7f8c8d'));
 
     g.edges().forEach(e => {
         const edge      = g.edge(e);
@@ -324,18 +382,66 @@ function renderEdges(svg, g, defs) {
             offsetY = (edgeIndex - (totalEdges - 1) / 2) * 14;
         }
 
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        path.setAttribute('d',            pointsToPath(points, offsetY));
-        path.setAttribute('stroke',       style.stroke);
-        path.setAttribute('stroke-width', style.strokeWidth);
-        path.setAttribute('fill',         'none');
-        path.setAttribute('opacity',      style.opacity);
-        if (style.strokeDasharray) {
-            path.setAttribute('stroke-dasharray', style.strokeDasharray);
-        }
-        path.setAttribute('marker-end', style.markerEnd);
+        // ── Edge path rendering ─────────────────────────────────────────────
+        // For normal first-in-step exec edges with a preceding observation:
+        //   Draw a single path that passes through a midpoint at ~70% of the
+        //   arc length.  marker-mid fires at that midpoint (obs arrowhead,
+        //   sized by obs_length) and marker-end fires at the target (thought
+        //   arrowhead, sized by thought length).  The line body itself uses the
+        //   thought stroke-width so the overall visual weight matches the edge.
+        //
+        // For all other edges: single path with marker-end only.
 
-        edgeGroup.appendChild(path);
+        const isNormalExec = (
+            edge.type === 'exec' &&
+            !edge.is_multi_node_step &&
+            !edge.is_thought_continuation
+        );
+        const useDoubleArrow = (
+            isNormalExec &&
+            settings.showObservation &&
+            edge.is_first_in_step &&
+            edge.obs_length > 0 &&
+            points && points.length >= 2
+        );
+
+        if (useDoubleArrow) {
+            // Find the point at 70% of arc length for the obs arrowhead
+            const midPt   = interpOnPath(points, 0.70, offsetY);
+            const obsW    = Math.round(obsLengthToWidth(edge.obs_length));
+            const obsMark = `url(#arrowhead-obs-w${obsW})`;
+
+            // Build a 3-point path: start → midPt → end
+            // marker-mid fires at midPt, marker-end fires at end
+            const firstPt = { x: points[0].x, y: points[0].y + offsetY };
+            const lastPt  = { x: points[points.length-1].x,
+                              y: points[points.length-1].y + offsetY };
+            const pathD3  = `M ${firstPt.x} ${firstPt.y} L ${midPt.x} ${midPt.y} L ${lastPt.x} ${lastPt.y}`;
+
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d',            pathD3);
+            path.setAttribute('fill',         'none');
+            path.setAttribute('stroke',       style.stroke);
+            path.setAttribute('stroke-width', String(style.strokeWidth));
+            path.setAttribute('opacity',      String(style.opacity));
+            path.setAttribute('marker-mid',   obsMark);
+            path.setAttribute('marker-end',   style.markerEnd);
+            edgeGroup.appendChild(path);
+
+        } else {
+            // Normal single-path rendering (thought-width body + one arrowhead).
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            path.setAttribute('d',    pointsToPath(points, offsetY));
+            path.setAttribute('fill', 'none');
+            path.setAttribute('stroke',       style.stroke);
+            path.setAttribute('stroke-width', String(style.strokeWidth));
+            path.setAttribute('opacity',      String(style.opacity));
+            if (style.strokeDasharray) {
+                path.setAttribute('stroke-dasharray', style.strokeDasharray);
+            }
+            path.setAttribute('marker-end', style.markerEnd);
+            edgeGroup.appendChild(path);
+        }
 
         // Step-number label (only on exec edges)
         if (edge.label && edge.type === 'exec') {
@@ -365,14 +471,8 @@ function makeNodeRect(node, fillAttr) {
     rect.setAttribute('rx',     '5');
     rect.setAttribute('ry',     '5');
     rect.setAttribute('fill',   fillAttr);
-    // Always set explicit stroke so SVG overrides CSS default
-    if (node.has_failure) {
-        rect.setAttribute('stroke',       '#e74c3c');
-        rect.setAttribute('stroke-width', '3');
-    } else {
-        rect.setAttribute('stroke',       '#2c3e50');
-        rect.setAttribute('stroke-width', '1.5');
-    }
+    rect.setAttribute('stroke',       '#2c3e50');
+    rect.setAttribute('stroke-width', '1.5');
     return rect;
 }
 
@@ -430,37 +530,6 @@ function renderNodes(svg, g, defs) {
             nodeGroup.appendChild(triangle);
         }
 
-        // Add observation indicator rectangle (if enabled and node has observation)
-        if (settings.showObservation && node.observation_length > 0) {
-            const obsWidth = Math.min(Math.max(node.observation_length / 50, 5), 50);
-            const obsHeight = node.height * 0.7;
-            const rightX = node.x + node.width / 2;
-            const centerY = node.y;
-
-            const obsRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            obsRect.setAttribute('x',      rightX + 4);
-            obsRect.setAttribute('y',      centerY - obsHeight / 2);
-            obsRect.setAttribute('width',  obsWidth);
-            obsRect.setAttribute('height', obsHeight);
-            obsRect.setAttribute('rx',     '2');
-            obsRect.setAttribute('ry',     '2');
-
-            // Color based on outcome
-            let obsFill;
-            if (node.observation_outcome === 'success') {
-                obsFill = '#7defa7';
-            } else if (node.observation_outcome === 'failure') {
-                obsFill = '#ff8080';
-            } else {
-                obsFill = '#bdc3c7';
-            }
-            obsRect.setAttribute('fill',    obsFill);
-            obsRect.setAttribute('opacity', '0.85');
-            obsRect.setAttribute('stroke', '#2c3e50');
-            obsRect.setAttribute('stroke-width', '0.5');
-
-            nodeGroup.appendChild(obsRect);
-        }
         
         const lines = node.displayLabel.split('\\n');
         const lineHeight = 16;
@@ -568,8 +637,19 @@ function openSidebar(node) {
 }
 
 function closeSidebar() {
-    document.getElementById('detailSidebar').classList.remove('open');
+    const sidebar = document.getElementById('detailSidebar');
+    sidebar.classList.remove('open');
     sidebarNodeId = null;
+    // Clear content after the CSS transition so the DOM collapse never races
+    // with the width animation and causes a page-height flash.
+    setTimeout(() => {
+        if (!sidebar.classList.contains('open')) {
+            const tabs    = document.getElementById('stepTabs');
+            const content = document.getElementById('sidebarContent');
+            if (tabs)    tabs.innerHTML    = '';
+            if (content) content.innerHTML = '';
+        }
+    }, 250);  // matches the 0.22s transition + small buffer
 }
 
 /**
@@ -638,15 +718,30 @@ function makeSidebarSection(title, cssClass, text) {
 }
 
 // ==================== Fullscreen ====================
+// Fullscreen the entire document so the browser owns the whole viewport.
+// A CSS class is toggled on .graph-container so it paints edge-to-edge while
+// fullscreen, then removed on exit so layout returns to its original state.
 function toggleFullscreen() {
-    const container = document.querySelector('.graph-container');
     if (!document.fullscreenElement) {
-        (container.requestFullscreen || container.webkitRequestFullscreen ||
-         container.mozRequestFullScreen).call(container);
+        document.documentElement.requestFullscreen().catch(() => {});
     } else {
-        (document.exitFullscreen || document.webkitExitFullscreen ||
-         document.mozCancelFullScreen).call(document);
+        document.exitFullscreen().catch(() => {});
     }
+}
+
+// Handles Esc key, button click, and any other exit path uniformly.
+document.addEventListener('fullscreenchange', _onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', _onFullscreenChange);
+
+function _onFullscreenChange() {
+    const container = document.querySelector('.graph-container');
+    if (document.fullscreenElement) {
+        container.classList.add('fullscreen-active');
+    } else {
+        container.classList.remove('fullscreen-active');
+    }
+    // Double rAF: first frame finishes the DOM update, second gets real dimensions.
+    requestAnimationFrame(() => requestAnimationFrame(fitToScreen));
 }
 
 // ==================== Zoom and Pan Controls ====================
@@ -667,34 +762,34 @@ function updateTransform() {
 }
 
 function fitToScreen() {
-    const container = graphEl.parentElement;
-    const containerWidth = container.clientWidth;
-    const containerHeight = container.clientHeight;
-    
-    const scaleX = containerWidth / graphWidth;
-    const scaleY = containerHeight / graphHeight;
+    // Use the #graph div's own dimensions — these are correct both in normal
+    // layout (CSS height: 900px) and when fullscreen-active forces it to fill
+    // the viewport via position:fixed.
+    const w = graphEl.clientWidth  || graphEl.offsetWidth;
+    const h = graphEl.clientHeight || graphEl.offsetHeight;
+
+    const scaleX = w / graphWidth;
+    const scaleY = h / graphHeight;
     currentScale = Math.min(scaleX, scaleY, 1) * 0.95;
-    
-    const scaledWidth = graphWidth * currentScale;
+
+    const scaledWidth  = graphWidth  * currentScale;
     const scaledHeight = graphHeight * currentScale;
-    currentX = (containerWidth - scaledWidth) / 2;
-    currentY = (containerHeight - scaledHeight) / 2;
-    
+    currentX = (w - scaledWidth)  / 2;
+    currentY = (h - scaledHeight) / 2;
+
     updateTransform();
 }
 
 function resetZoom() {
     currentScale = 1;
-    const container = graphEl.parentElement;
-    currentX = (container.clientWidth - graphWidth) / 2;
-    currentY = (container.clientHeight - graphHeight) / 2;
+    currentX = (graphEl.clientWidth  - graphWidth)  / 2;
+    currentY = (graphEl.clientHeight - graphHeight) / 2;
     updateTransform();
 }
 
 function zoomIn() {
-    const container = graphEl.parentElement;
-    const centerX = container.clientWidth / 2;
-    const centerY = container.clientHeight / 2;
+    const centerX = graphEl.clientWidth  / 2;
+    const centerY = graphEl.clientHeight / 2;
     
     const oldScale = currentScale;
     currentScale = Math.min(currentScale * 1.2, 3);
@@ -707,9 +802,8 @@ function zoomIn() {
 }
 
 function zoomOut() {
-    const container = graphEl.parentElement;
-    const centerX = container.clientWidth / 2;
-    const centerY = container.clientHeight / 2;
+    const centerX = graphEl.clientWidth  / 2;
+    const centerY = graphEl.clientHeight / 2;
     
     const oldScale = currentScale;
     currentScale = Math.max(currentScale / 1.2, 0.3);
@@ -777,6 +871,41 @@ function setupPanning() {
     });
 }
 
+// ==================== Sidebar Resize ====================
+function setupSidebarResize() {
+    const resizer = document.getElementById('sidebarResizer');
+    const sidebar = document.getElementById('detailSidebar');
+    if (!resizer || !sidebar) return;
+
+    let isResizing = false;
+    let startX     = 0;
+    let startWidth = 0;
+
+    resizer.addEventListener('mousedown', (e) => {
+        isResizing = true;
+        startX     = e.clientX;
+        startWidth = sidebar.offsetWidth;
+        document.body.style.cursor    = 'col-resize';
+        document.body.style.userSelect = 'none';
+        e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!isResizing) return;
+        // Dragging left (towards graph) increases width; right decreases it.
+        const delta    = startX - e.clientX;
+        const newWidth = Math.max(260, Math.min(900, startWidth + delta));
+        sidebar.style.width = newWidth + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (!isResizing) return;
+        isResizing = false;
+        document.body.style.cursor    = '';
+        document.body.style.userSelect = '';
+    });
+}
+
 // ==================== Initialization ====================
 function initializeGraph() {
     graphEl = document.getElementById('graph');
@@ -797,6 +926,10 @@ function initializeGraph() {
     setupTooltips();
     setupWheelZoom();
     setupPanning();
+    setupSidebarResize();
+    // Wire close button via JS so it's guaranteed to find the named function
+    const _closeBtn = document.getElementById('sidebarCloseBtn');
+    if (_closeBtn) _closeBtn.addEventListener('click', closeSidebar);
     
     setTimeout(fitToScreen, 150);
 }
