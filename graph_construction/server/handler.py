@@ -39,6 +39,7 @@ class GraphHandler(BaseHTTPRequestHandler):
     eval_report_path: str   = None
     cmd_parser              = None
     assets_dir:       Path  = None   # graph_template.html, styles.css, graph_renderer.js
+    source_type:      str   = None   # 'swe_agent_dir' | 'openhands_jsonl' | 'openhands_dir'
 
     # ── Logging ────────────────────────────────────────────────────────
     def log_message(self, fmt, *args):
@@ -68,7 +69,7 @@ class GraphHandler(BaseHTTPRequestHandler):
                 thought_quotes    = params.get("thought_quotes",  ["true"])[0].lower() == "true"
                 node_verbosity    = params.get("node_verbosity",  ["true"])[0].lower() == "true"
                 show_observation  = params.get("show_observation", ["false"])[0].lower() == "true"
-                
+
                 if not instance_id:
                     self._error(400, "Missing ?id= parameter")
                 else:
@@ -97,6 +98,7 @@ class GraphHandler(BaseHTTPRequestHandler):
             instance_id       = instance_id,
             eval_report_path  = self.eval_report_path,
             cmd_parser        = self.cmd_parser,
+            graphs_dir        = self.graphs_dir,   # needed for per-instance config YAMLs
             filter_cd         = filter_cd,
         )
 
