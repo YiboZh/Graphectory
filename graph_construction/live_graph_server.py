@@ -85,8 +85,6 @@ def setup_cmd_parser():
 
         if loaded:
             print(f"  [parser] Loaded tool configs: {', '.join(loaded)}")
-        else:
-            print("  [parser] No tool config YAMLs found – parser has no tool definitions")
 
         return parser
 
