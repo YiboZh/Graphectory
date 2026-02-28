@@ -4,12 +4,7 @@ live_graph_server.py
 
 Single entry point.  Run:
 
-    python live_graph_server.py --trajs <dir-or-jsonl> --eval_report <file>
-
---trajs may be:
-  • A directory containing SWE-agent *.traj files  (original behaviour)
-  • A single OpenHands output.jsonl file            (new)
-  • A directory containing OpenHands output.jsonl files (new)
+    python live_graph_server.py --trajs <dir> --eval_report <file>
 
 Then open http://localhost:8000 in your browser.
 
@@ -36,25 +31,19 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Examples
 --------
-  # SWE-agent: directory of .traj files
   python live_graph_server.py \\
       --trajs output/SWE-agent/graphs/deepseek-v3 \\
       --eval_report report.json
 
-  # OpenHands: single output.jsonl file
   python live_graph_server.py \\
-      --trajs trajectories/OpenHands/run_1/output.jsonl \\
-      --eval_report trajectories/OpenHands/run_1/report.json
-
-  # OpenHands: directory containing output.jsonl files
-  python live_graph_server.py \\
-      --trajs trajectories/OpenHands/run_1 \\
-      --eval_report trajectories/OpenHands/run_1/report.json \\
+      --trajs trajectories \\
+      --eval_report report.json \\
+      --assets_dir custom_templates \\
       --port 8080
         """,
     )
     p.add_argument("--trajs",    required=True,
-                   help="Directory of .traj files OR a single OpenHands output.jsonl file")
+                   help="Directory that contains .traj files")
     p.add_argument("--eval_report",   required=True,
                    help="Evaluation report JSON used for resolution status")
     p.add_argument("--assets_dir",    default=None,
@@ -99,21 +88,6 @@ def setup_cmd_parser():
         return None
 
 
-def _detect_source_type(trajs_path: Path) -> str:
-    """Return 'swe_agent_dir', 'openhands_jsonl', or 'openhands_dir'."""
-    if trajs_path.is_file() and trajs_path.suffix == ".jsonl":
-        return "openhands_jsonl"
-    if trajs_path.is_dir():
-        # If any .jsonl files present (and no .traj files), treat as OpenHands directory
-        has_jsonl = any(trajs_path.rglob("*.jsonl"))
-        has_traj  = any(trajs_path.rglob("*.traj"))
-        if has_jsonl and not has_traj:
-            return "openhands_dir"
-        # Default to SWE-agent directory even if mixed
-        return "swe_agent_dir"
-    return "swe_agent_dir"
-
-
 def main() -> int:
     args = parse_args()
 
@@ -132,17 +106,11 @@ def main() -> int:
         print(f"[ERROR] assets_dir does not exist: {assets_dir}")
         return 1
 
-    source_type = _detect_source_type(trajs)
-    print(f"  [source] Detected trajectory source type: {source_type}")
-
     # Inject configuration into the handler class
-    # Note: handler.py uses GraphHandler.graphs_dir; live_graph_server used to set
-    # GraphHandler.trajs — this is now unified to graphs_dir.
-    GraphHandler.graphs_dir       = trajs
+    GraphHandler.trajs       = trajs
     GraphHandler.eval_report_path = str(eval_report)
     GraphHandler.cmd_parser       = setup_cmd_parser()
     GraphHandler.assets_dir       = assets_dir
-    GraphHandler.source_type      = source_type
 
     httpd = HTTPServer(("", args.port), GraphHandler)
 
