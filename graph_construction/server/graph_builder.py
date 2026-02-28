@@ -75,10 +75,14 @@ class GraphBuilder(_GraphBuilderBase):
 # ── Directory scanning ──────────────────────────────────────────────────────
 
 def scan_trajectories(graphs_dir: Path,
-                      eval_report_path: str | None = None) -> list[dict]:
+                      eval_report_path: str | None = None,
+                      agent_type: str = "sa") -> list[dict]:
     """Return a sorted list of trajectory metadata dicts.
 
     Each dict has: instance_id, status, difficulty, step_count.
+
+    For SWE-agent (agent_type='sa'), graphs_dir is a directory tree of .traj files.
+    For OpenHands (agent_type='oh'), graphs_dir is a path to an output.jsonl file.
     """
     resolved_set:   set[str] = set()
     unresolved_set: set[str] = set()
@@ -93,6 +97,48 @@ def scan_trajectories(graphs_dir: Path,
 
     results = []
 
+    if agent_type == "oh":
+        # OpenHands: graphs_dir is actually the output.jsonl file
+        jsonl_path = graphs_dir
+        if not jsonl_path.is_file():
+            return results
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                instance_id = entry.get("instance_id")
+                if not instance_id:
+                    continue
+
+                if instance_id in resolved_set:
+                    status = "resolved"
+                elif instance_id in unresolved_set:
+                    status = "unresolved"
+                else:
+                    status = "unsubmitted"
+
+                # Count action steps (non-system, non-message observations)
+                step_count = sum(
+                    1 for s in entry.get("history", [])
+                    if s.get("observation") not in ("system", "message", None)
+                )
+
+                results.append({
+                    "instance_id": instance_id,
+                    "status":      status,
+                    "difficulty":  "unknown",
+                    "step_count":  step_count,
+                })
+
+        results.sort(key=lambda x: x["instance_id"])
+        return results
+
+    # SWE-agent: directory tree of .traj files
     for traj_file in sorted(graphs_dir.rglob("*.traj")):
         instance_id = traj_file.stem
 
@@ -143,11 +189,37 @@ def scan_trajectories(graphs_dir: Path,
 
 # ── Trajectory loading ──────────────────────────────────────────────────────
 
-def load_trajectory(graphs_dir: Path, instance_id: str) -> dict:
+def load_trajectory(graphs_dir: Path, instance_id: str,
+                    agent_type: str = "sa") -> dict:
     """Load and return raw trajectory data for *instance_id*.
 
-    Raises FileNotFoundError if the .traj file cannot be found.
+    For SWE-agent, searches for a matching .traj file under graphs_dir.
+    For OpenHands, scans the output.jsonl file for the matching instance.
+
+    Raises FileNotFoundError if the trajectory cannot be found.
     """
+    if agent_type == "oh":
+        jsonl_path = graphs_dir
+        if not jsonl_path.is_file():
+            raise FileNotFoundError(
+                f"OpenHands output.jsonl not found: {jsonl_path}"
+            )
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("instance_id") == instance_id:
+                    return entry
+        raise FileNotFoundError(
+            f"No entry for '{instance_id}' found in {jsonl_path}"
+        )
+
+    # SWE-agent: search for .traj file
     for traj_file in graphs_dir.rglob(f"{instance_id}.traj"):
         with open(traj_file) as f:
             return json.load(f)
@@ -268,12 +340,251 @@ def _mark_thought_continuation(
         edges[last_key]["is_thought_continuation"] = True
 
 
+# ── OpenHands graph construction ────────────────────────────────────────────
+
+def _build_graph_oh(traj_data: dict, instance_id: str,
+                    eval_report_path: str, cmd_parser,
+                    filter_cd: bool = True):
+    """Build a NetworkX MultiDiGraph from an OpenHands trajectory entry.
+
+    OpenHands trajectories store tool calls inside ``history`` entries.
+    Each history step has an ``observation`` field that names the event type,
+    plus a ``tool_call_metadata`` dict that contains the model's function call.
+    Steps with observation in {"system", "message"} are skipped.
+    The ``thought`` for each step is extracted from the model response content.
+    """
+    try:
+        from mapPhase import get_phase
+    except ImportError:
+        def get_phase(*_args, **_kwargs):
+            return "general"
+
+    builder          = GraphBuilder()
+    prev_phases_list: list[str] = []
+    prev_thought:    str = ""
+    prev_step_first_node: str | None = None
+    step_idx = 0
+
+    for step in traj_data.get("history", []):
+        obs_type = step.get("observation")
+        if obs_type in ("system", "message") or obs_type is None:
+            continue
+
+        # Extract thought from the model response (assistant message content)
+        thought = ""
+        tool_call_meta = step.get("tool_call_metadata", {})
+        model_response = tool_call_meta.get("model_response", {})
+        choices = model_response.get("choices", [])
+        if choices:
+            msg = choices[0].get("message", {})
+            content = msg.get("content") or ""
+            if isinstance(content, str):
+                thought = content
+            elif isinstance(content, list):
+                # content blocks: pull out text blocks
+                thought = "\n".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+
+        observation = step.get("content", "") or ""
+
+        thought_len_raw   = compute_thought_length_raw(thought)
+        thought_len_clean = compute_thought_length_clean(thought)
+
+        # Gather tool calls from the metadata (same logic as generatejson.py)
+        tool_calls = model_response.get("choices", [])
+        if not tool_calls and tool_call_meta:
+            tool_calls = [tool_call_meta]
+
+        parsed_commands = []
+        for call in tool_calls:
+            function_call = None
+            if isinstance(call, dict):
+                if "function" in call:
+                    function_call = call["function"]
+                else:
+                    msg_obj = call.get("message", {})
+                    for tc in (msg_obj.get("tool_calls") or []):
+                        if "function" in tc:
+                            function_call = tc["function"]
+                            break
+
+            if not function_call:
+                continue
+
+            tool_name = function_call.get("name", "")
+            args_raw  = function_call.get("arguments", "{}")
+            try:
+                args_loaded = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            except (json.JSONDecodeError, TypeError):
+                args_loaded = {}
+
+            if tool_name == "execute_bash":
+                cmd_str = args_loaded.get("command", "").strip()
+                cmds = cmd_parser.parse(cmd_str) if cmd_str else []
+                if cmds:
+                    parsed_commands.extend(cmds)
+            else:
+                subcommand = args_loaded.pop("command", None)
+                parsed_commands.append({
+                    "tool":       tool_name,
+                    "subcommand": subcommand,
+                    "args":       args_loaded,
+                    "flags":      {},
+                    "command":    "",
+                })
+
+        if not parsed_commands:
+            step_idx += 1
+            continue
+
+        # Optional cd filtering
+        has_cd = False
+        if filter_cd and len(parsed_commands) > 1:
+            first = parsed_commands[0]
+            if (first.get("command") or "").strip().lower() == "cd":
+                has_cd          = True
+                parsed_commands = parsed_commands[1:]
+
+        is_first_in_step  = True
+        node_keys_in_step = []
+        step_first_node: str | None = None
+
+        for parsed in parsed_commands:
+            tool       = (parsed.get("tool")       or "").strip()
+            subcommand = (parsed.get("subcommand") or "").strip()
+            command    = (parsed.get("command")    or "").strip()
+            args       = parsed.get("args",  {})
+            flags      = parsed.get("flags", {})
+
+            if tool == "think":
+                node_key = builder.add_or_update_node(
+                    node_label     = "think",
+                    args           = {},
+                    flags          = {},
+                    phase          = "general",
+                    step_idx       = step_idx,
+                    tool           = None,
+                    command        = None,
+                    subcommand     = None,
+                    thought_length = thought_len_raw,
+                    has_cd         = False,
+                )
+                builder.G.nodes[node_key]["thought_len_raw"]   = thought_len_raw
+                builder.G.nodes[node_key]["thought_len_clean"] = thought_len_clean
+                _accumulate_observation(builder.G.nodes[node_key], observation)
+                _accumulate_step_data(builder.G.nodes[node_key], step_idx,
+                                      thought, "", observation)
+                builder.add_execution_edge(
+                    node_key, step_idx,
+                    is_first_in_step=is_first_in_step,
+                    thought_length_raw=thought_len_raw if is_first_in_step else 0,
+                    thought_length_clean=thought_len_clean if is_first_in_step else 0,
+                )
+                if is_first_in_step:
+                    _mark_thought_continuation(
+                        builder.G, prev_step_first_node, node_key,
+                        prev_thought, thought,
+                    )
+                    if step_first_node is None:
+                        step_first_node = node_key
+                builder.update_previous_node(node_key)
+                prev_phases_list.append("general")
+                builder.prev_phases.add("general")
+                node_keys_in_step.append(node_key)
+                is_first_in_step = False
+                continue
+
+            if tool:
+                node_label = f"{tool}: {subcommand}" if subcommand else tool
+            else:
+                node_label = command or obs_type or "action"
+
+            phase = get_phase(tool, subcommand, command, args, prev_phases_list)
+
+            outcome = check_command_outcome(
+                command=command, observation=observation,
+                tool=tool, subcommand=subcommand,
+                args=args if isinstance(args, dict) else {},
+            )
+            edit_status = check_edit_status(tool, subcommand, args, observation)
+            if edit_status and isinstance(args, dict):
+                args["edit_status"] = edit_status
+            if outcome and isinstance(args, dict):
+                args.setdefault("command_outcome", outcome)
+
+            node_key = builder.add_or_update_node(
+                node_label     = node_label,
+                args           = args,
+                flags          = flags,
+                phase          = phase,
+                step_idx       = step_idx,
+                tool           = tool,
+                command        = command,
+                subcommand     = subcommand,
+                thought_length = thought_len_raw,
+                has_cd         = has_cd,
+            )
+
+            builder.G.nodes[node_key]["thought_len_raw"]   = thought_len_raw
+            builder.G.nodes[node_key]["thought_len_clean"] = thought_len_clean
+            _accumulate_step_data(builder.G.nodes[node_key], step_idx,
+                                  thought, f"{tool} {subcommand}".strip(), observation)
+
+            node_keys_in_step.append(node_key)
+            if step_first_node is None:
+                step_first_node = node_key
+
+            builder.add_execution_edge(
+                node_key, step_idx,
+                is_first_in_step=is_first_in_step,
+                thought_length_raw=thought_len_raw if is_first_in_step else 0,
+                thought_length_clean=thought_len_clean if is_first_in_step else 0,
+            )
+
+            if is_first_in_step:
+                _mark_thought_continuation(
+                    builder.G, prev_step_first_node, node_key,
+                    prev_thought, thought,
+                )
+
+            builder.update_previous_node(node_key)
+            prev_phases_list.append(phase)
+            builder.prev_phases.add(phase)
+            is_first_in_step = False
+
+        if node_keys_in_step:
+            last_node = node_keys_in_step[-1]
+            _accumulate_observation(builder.G.nodes[last_node], observation)
+
+        prev_thought = thought
+        prev_step_first_node = step_first_node
+        step_idx += 1
+
+    # Post-processing
+    build_hierarchical_edges(builder.G, builder.localization_nodes)
+
+    resolution_status = determine_resolution_status(instance_id, eval_report_path)
+    builder.G.graph["resolution_status"] = resolution_status
+    builder.G.graph["instance_name"]     = instance_id
+
+    try:
+        from buildGraph import difficulty_lookup
+        builder.G.graph["debug_difficulty"] = difficulty_lookup.get(instance_id, "unknown")
+    except Exception:
+        builder.G.graph["debug_difficulty"] = "unknown"
+
+    return builder.G
+
+
 # ── Graph construction ──────────────────────────────────────────────────────
 
 def build_graph(traj_data: dict, instance_id: str,
                 eval_report_path: str, cmd_parser,
                 graphs_dir: Path | None = None,
-                filter_cd: bool = True):
+                filter_cd: bool = True,
+                agent_type: str = "sa"):
     """Build and return a NetworkX MultiDiGraph from *traj_data*.
 
     The instance's tool config YAML is auto-discovered from:
@@ -300,6 +611,11 @@ def build_graph(traj_data: dict, instance_id: str,
             "cmd_parser must be a CommandParser instance. "
             "Pass a configured CommandParser from live_graph_server.setup_cmd_parser()."
         )
+
+    # Dispatch to agent-specific builder
+    if agent_type == "oh":
+        return _build_graph_oh(traj_data, instance_id, eval_report_path,
+                               cmd_parser, filter_cd)
 
     # Build a per-instance parser loaded with this trajectory's config YAML
     if graphs_dir is not None:

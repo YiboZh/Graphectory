@@ -35,7 +35,8 @@ class GraphHandler(BaseHTTPRequestHandler):
     """Thin HTTP handler – delegates everything to the server modules."""
 
     # Injected by live_graph_server.py before the server starts
-    graphs_dir:       Path  = None
+    graphs_dir:       Path  = None   # directory (SA) or .jsonl file (OH)
+    agent_type:       str   = "sa"   # "sa" or "oh"
     eval_report_path: str   = None
     cmd_parser              = None
     assets_dir:       Path  = None   # graph_template.html, styles.css, graph_renderer.js
@@ -85,12 +86,14 @@ class GraphHandler(BaseHTTPRequestHandler):
     # ── Route handlers ──────────────────────────────────────────────────
 
     def _api_graphs(self):
-        graphs = scan_trajectories(self.graphs_dir, self.eval_report_path)
+        graphs = scan_trajectories(self.graphs_dir, self.eval_report_path,
+                                   agent_type=self.agent_type)
         self._respond_json(graphs)
 
     def _api_graph(self, instance_id: str, filter_cd: bool,
                    thought_quotes: bool, node_verbosity: bool, show_observation: bool):
-        traj_data = load_trajectory(self.graphs_dir, instance_id)
+        traj_data = load_trajectory(self.graphs_dir, instance_id,
+                                    agent_type=self.agent_type)
 
         G = build_graph(
             traj_data         = traj_data,
@@ -98,6 +101,7 @@ class GraphHandler(BaseHTTPRequestHandler):
             eval_report_path  = self.eval_report_path,
             cmd_parser        = self.cmd_parser,
             filter_cd         = filter_cd,
+            agent_type        = self.agent_type,
         )
 
         html = render_graph_html(G, filter_cd, thought_quotes, node_verbosity,

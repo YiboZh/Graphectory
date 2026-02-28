@@ -31,8 +31,14 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Examples
 --------
+  # SWE-agent: pass a directory containing .traj files
   python live_graph_server.py \\
       --trajs output/SWE-agent/graphs/deepseek-v3 \\
+      --eval_report report.json
+
+  # OpenHands: pass the output.jsonl file directly
+  python live_graph_server.py \\
+      --trajs trajectories/OpenHands/output.jsonl \\
       --eval_report report.json
 
   python live_graph_server.py \\
@@ -43,7 +49,8 @@ Examples
         """,
     )
     p.add_argument("--trajs",    required=True,
-                   help="Directory that contains .traj files")
+                   help="Directory that contains .traj files (SWE-agent), "
+                        "or path to an output.jsonl file (OpenHands)")
     p.add_argument("--eval_report",   required=True,
                    help="Evaluation report JSON used for resolution status")
     p.add_argument("--assets_dir",    default=None,
@@ -106,8 +113,18 @@ def main() -> int:
         print(f"[ERROR] assets_dir does not exist: {assets_dir}")
         return 1
 
+    # Detect agent type: a .jsonl file → OpenHands; a directory → SWE-agent
+    if trajs.is_file() and trajs.suffix == ".jsonl":
+        agent_type = "oh"
+    elif trajs.is_dir():
+        agent_type = "sa"
+    else:
+        print(f"[ERROR] --trajs must be a directory (SWE-agent) or a .jsonl file (OpenHands): {trajs}")
+        return 1
+
     # Inject configuration into the handler class
-    GraphHandler.trajs       = trajs
+    GraphHandler.graphs_dir       = trajs        # may be a file (OH) or dir (SA)
+    GraphHandler.agent_type       = agent_type
     GraphHandler.eval_report_path = str(eval_report)
     GraphHandler.cmd_parser       = setup_cmd_parser()
     GraphHandler.assets_dir       = assets_dir
@@ -117,7 +134,8 @@ def main() -> int:
     print(f"\n{'─'*60}")
     print(f"  Trajectory Graph Server")
     print(f"{'─'*60}")
-    print(f"  Graphs dir   : {trajs.absolute()}")
+    print(f"  Agent type   : {agent_type.upper()} ({'OpenHands (.jsonl)' if agent_type == 'oh' else 'SWE-agent (directory)'})")
+    print(f"  Trajs path   : {trajs.absolute()}")
     print(f"  Eval report  : {eval_report.absolute()}")
     print(f"  Assets dir   : {assets_dir.absolute()}")
     print(f"  URL          : http://localhost:{args.port}")
