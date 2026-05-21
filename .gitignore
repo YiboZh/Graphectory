@@ -6,3 +6,6 @@ dist/
 build/
 application/
 *.pdf
+*.png
+*.html
+*.json
