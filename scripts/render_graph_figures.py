@@ -28,6 +28,19 @@ MODEL_TRAJ_DIRS = {
     "deepseek-r1-0528": "deepseek-r1-0528_maxiter_100_N_v0.40.0-no-hint-run_1",
     "devstral-small":   "devstral-small_maxiter_100_N_v0.40.0-no-hint-run_1",
 }
+TRAJ_DIR_TO_MODEL = {v: k for k, v in MODEL_TRAJ_DIRS.items()}
+
+PHASE_TYPE_COLORS = {
+    **PHASE_COLORS,
+    "patching": PHASE_COLORS["patch"],
+}
+
+NODE_TYPE_COLORS = {
+    "start":        "#E8E8E8",
+    "phase":        None,  # resolved from phase_type
+    "code_block":   "#FFF9C4",
+    "termination":  "#FFCDD2",
+}
 
 
 def load_resolution_sets(trajectories_dir: Path, models: list[str]) -> dict[str, dict[str, set[str]]]:
@@ -53,16 +66,72 @@ def outcome_for(model: str, instance_id: str, resolution_sets: dict) -> str:
     return "failed"
 
 
+def outcome_from_json(json_path: Path) -> str:
+    with open(json_path) as f:
+        status = json.load(f).get("graph", {}).get("resolution_status", "")
+    return "success" if status == "resolved" else "failed"
+
+
+def _node_label(nd: dict, node_id: str, label_len: int) -> str:
+    if nd.get("label"):
+        return nd["label"][:label_len]
+    node_type = nd.get("node_type")
+    if node_type == "phase":
+        phase = nd.get("phase_type", "general")
+        return f"{phase} [{nd.get('start_step', '?')}-{nd.get('end_step', '?')}]"[:label_len]
+    if node_type == "code_block":
+        path = nd.get("file_path", "")
+        if "\n" in path or len(path) > 120:
+            name = "code_block"
+        else:
+            name = path.rsplit("/", 1)[-1] if path else "?"
+        sl, el = nd.get("start_line"), nd.get("end_line")
+        if sl is not None and el is not None:
+            return f"{name}:{sl}-{el}"[:label_len]
+        return name[:label_len]
+    if node_type == "termination":
+        return (nd.get("termination_type") or "termination")[:label_len]
+    if node_type == "start":
+        return "start"
+    return str(node_id)[:label_len]
+
+
+def _node_color(nd: dict) -> str:
+    node_type = nd.get("node_type")
+    if node_type == "phase":
+        phase = nd.get("phase_type", "general")
+        return PHASE_TYPE_COLORS.get(phase, PHASE_COLORS["general"])
+    if node_type in NODE_TYPE_COLORS and NODE_TYPE_COLORS[node_type]:
+        return NODE_TYPE_COLORS[node_type]
+    phases = nd.get("phases") or ["general"]
+    return PHASE_COLORS.get(phases[0], PHASE_COLORS["general"])
+
+
+def _graph_for_render(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Return a structure-only copy; styling attrs are set explicitly after to_agraph."""
+    R = nx.MultiDiGraph()
+    R.add_nodes_from(G.nodes)
+    for u, v, key in G.edges(keys=True):
+        R.add_edge(u, v, key=key)
+    return R
+
+
+def _escape_dot_label(label: str) -> str:
+    """Quote and escape a label for Graphviz DOT syntax."""
+    escaped = label.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _build_agraph(G, splines="ortho", label_len=40, fontsize=8, dpi=DEFAULT_DPI):
-    A = nx.nx_agraph.to_agraph(G)
+    R = _graph_for_render(G)
+    A = nx.nx_agraph.to_agraph(R)
     A.graph_attr.update(rankdir="TB", splines=splines, bgcolor="white", pad="0.5", dpi=str(dpi))
     A.node_attr.update(shape="box", style="filled,rounded", fontsize=fontsize, fontname="DejaVu Sans")
     A.edge_attr.update(fontsize=fontsize - 1, arrowsize=0.5)
     for n in A.nodes():
         nd = G.nodes[n]
-        phases = nd.get("phases") or ["general"]
-        A.get_node(n).attr["fillcolor"] = PHASE_COLORS.get(phases[0], PHASE_COLORS["general"])
-        A.get_node(n).attr["label"] = (nd.get("label") or n)[:label_len].replace("\n", "\\n")
+        A.get_node(n).attr["fillcolor"] = _node_color(nd)
+        A.get_node(n).attr["label"] = _escape_dot_label(_node_label(nd, n, label_len))
     return A
 
 
@@ -96,16 +165,27 @@ def collect_jobs(
     output_dir: Path,
     models: list[str],
     resolution_sets: dict,
+    *,
+    auto_discover: bool = False,
+    use_json_resolution: bool = False,
 ) -> list[tuple[str, str]]:
     jobs = []
-    for model in models:
-        model_dir = graphs_dir / model
+    if auto_discover:
+        model_dirs = sorted(p for p in graphs_dir.iterdir() if p.is_dir())
+    else:
+        model_dirs = [graphs_dir / model for model in models]
+
+    for model_dir in model_dirs:
         if not model_dir.is_dir():
             print(f"[WARN] Model dir not found: {model_dir}", file=sys.stderr)
             continue
+        model = TRAJ_DIR_TO_MODEL.get(model_dir.name, model_dir.name)
         for json_path in sorted(model_dir.glob("*/*.json")):
             iid = json_path.parent.name
-            outcome = outcome_for(model, iid, resolution_sets)
+            if use_json_resolution:
+                outcome = outcome_from_json(json_path)
+            else:
+                outcome = outcome_for(model, iid, resolution_sets)
             png_path = output_dir / outcome / model / f"{iid}.png"
             jobs.append((str(json_path), str(png_path)))
     return jobs
@@ -148,12 +228,24 @@ def main():
                         help=f"Output PNG resolution (default: {DEFAULT_DPI})")
     parser.add_argument("--force", action="store_true",
                         help="Re-render even if PNG already exists")
+    parser.add_argument("--auto_discover", action="store_true",
+                        help="Scan graphs_dir for model subdirectories (supports traj dir names)")
+    parser.add_argument("--use_json_resolution", action="store_true",
+                        help="Use resolution_status from graph JSON instead of eval reports")
     args = parser.parse_args()
 
     resolution_sets = load_resolution_sets(args.trajectories_dir, args.models)
-    reorganize_existing(args.output_dir, args.models, resolution_sets)
+    if not args.auto_discover:
+        reorganize_existing(args.output_dir, args.models, resolution_sets)
 
-    jobs = collect_jobs(args.graphs_dir, args.output_dir, args.models, resolution_sets)
+    jobs = collect_jobs(
+        args.graphs_dir,
+        args.output_dir,
+        args.models,
+        resolution_sets,
+        auto_discover=args.auto_discover,
+        use_json_resolution=args.use_json_resolution,
+    )
     if not args.force:
         jobs = [(j, p) for j, p in jobs if not Path(p).exists()]
 

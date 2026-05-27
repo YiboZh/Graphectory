@@ -17,26 +17,163 @@ Graphectory graph.
 
 ## Table of contents
 
-1. [Motivation and design overview](#motivation-and-design-overview)
-2. [Graph-level metadata](#graph-level-metadata)
-3. [Node types and features](#node-types-and-features)
+1. [How to construct graphs](#how-to-construct-graphs)
+2. [Motivation and design overview](#motivation-and-design-overview)
+3. [Graph-level metadata](#graph-level-metadata)
+4. [Node types and features](#node-types-and-features)
    - [Start Node](#start-node)
    - [Phase Node](#phase-node)
    - [Code Block Node](#code-block-node)
    - [Termination Node](#termination-node)
-4. [Edge types and features](#edge-types-and-features)
+5. [Edge types and features](#edge-types-and-features)
    - [start_to_phase](#start_to_phase)
    - [phase_transition](#phase_transition)
    - [phase_code_operation](#phase_code_operation)
    - [phase_to_termination / start_to_termination](#phase_to_termination--start_to_termination)
-5. [How each feature is constructed](#how-each-feature-is-constructed)
-6. [How OpenHands raw trajectories are parsed](#how-openhands-raw-trajectories-are-parsed)
-7. [Phase classification rules](#phase-classification-rules)
-8. [Code-block operation extraction](#code-block-operation-extraction)
-9. [Termination type detection](#termination-type-detection)
-10. [Known limitations of this first version](#known-limitations-of-this-first-version)
-11. [How this graph differs from the existing Graphectory graph](#how-this-graph-differs-from-the-existing-graphectory-graph)
-12. [Collection-method legend](#collection-method-legend)
+6. [How each feature is constructed](#how-each-feature-is-constructed)
+7. [How OpenHands raw trajectories are parsed](#how-openhands-raw-trajectories-are-parsed)
+8. [Phase classification rules](#phase-classification-rules)
+9. [Code-block operation extraction](#code-block-operation-extraction)
+10. [Termination type detection](#termination-type-detection)
+11. [Known limitations of this first version](#known-limitations-of-this-first-version)
+12. [How this graph differs from the existing Graphectory graph](#how-this-graph-differs-from-the-existing-graphectory-graph)
+13. [Collection-method legend](#collection-method-legend)
+
+---
+
+## How to construct graphs
+
+All graph construction runs from the repo root using the project's virtual environment.
+
+### Prerequisites
+
+```bash
+# Activate the virtual environment (all dependencies are already installed)
+source /home/yiboz7/code/Graphectory/.venv/bin/activate
+```
+
+### Generate graphs for all OpenHands models (default)
+
+```bash
+python scripts/generate_phase_codeblock_graphs.py
+```
+
+This uses the default paths:
+- **Input:**  `/home/yiboz7/data/raw_trajectories/OpenHands/`
+- **Output:** `/home/yiboz7/data/processed_graphs/phase_codeblock_openhands/`
+
+Each model-run subdirectory containing an `output.jsonl` is discovered automatically.
+The local `report.json` in each model directory is used for `resolution_status` lookup.
+
+### Common options
+
+```bash
+# Custom input/output paths
+python scripts/generate_phase_codeblock_graphs.py \
+    --trajs_root  /path/to/raw_trajectories/OpenHands \
+    --output_root /path/to/processed_graphs/phase_codeblock_openhands
+
+# Process only specific model runs
+python scripts/generate_phase_codeblock_graphs.py \
+    --model_dirs claude-sonnet-4_maxiter_100_N_v0.40.0-no-hint-run_1 \
+                 deepseek-chat_maxiter_100_N_v0.40.0-no-hint-run_1
+
+# Use a single shared eval report for all models
+python scripts/generate_phase_codeblock_graphs.py \
+    --eval_report /path/to/report.json
+
+# Control parallelism (default: 8 workers)
+python scripts/generate_phase_codeblock_graphs.py --workers 16
+
+# Enable debug logging
+python scripts/generate_phase_codeblock_graphs.py --verbose
+```
+
+### All CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--trajs_root` | `/home/yiboz7/data/raw_trajectories/OpenHands` | Root directory containing model-run subdirectories |
+| `--output_root` | `/home/yiboz7/data/processed_graphs/phase_codeblock_openhands` | Root directory for output graphs |
+| `--model_dirs` | *(all)* | Restrict to specific model-run directory names (space-separated) |
+| `--eval_report` | *(per-model `report.json`)* | Path to a shared eval report JSON for `resolution_status` lookup |
+| `--workers` | `8` | Number of parallel worker processes per model run |
+| `--verbose` | off | Enable DEBUG-level logging |
+
+### Output structure
+
+```
+{output_root}/
+└── {model_dir_name}/
+    └── {instance_id}/
+        └── {instance_id}.json      ← NetworkX node-link JSON graph
+```
+
+Example:
+```
+/home/yiboz7/data/processed_graphs/phase_codeblock_openhands/
+├── claude-sonnet-4_maxiter_100_N_v0.40.0-no-hint-run_1/
+│   ├── astropy__astropy-12907/
+│   │   └── astropy__astropy-12907.json
+│   └── django__django-12345/
+│       └── django__django-12345.json
+├── deepseek-chat_maxiter_100_N_v0.40.0-no-hint-run_1/
+│   └── ...
+└── ...
+```
+
+### Logging and exit codes
+
+The script logs a per-instance `OK` / `ERR` line and prints a summary table at the end:
+
+```
+======================================================================
+PHASE-CODEBLOCK GRAPH GENERATION SUMMARY
+======================================================================
+  claude-sonnet-4_maxiter_100_N_v0.40.0-no-hint-run_1
+    success=500  error=0  skip=0
+  ...
+----------------------------------------------------------------------
+  TOTAL  trajectories processed : 1974
+  TOTAL  graphs generated       : 1974
+  TOTAL  failed trajectories    : 0
+  TOTAL  skipped trajectories   : 0
+  Output root                   : /home/yiboz7/data/processed_graphs/phase_codeblock_openhands
+======================================================================
+```
+
+Exit code is `0` when all trajectories succeed, `1` if any errors occurred.
+
+### Using the builder programmatically
+
+```python
+import json, sys
+sys.path.insert(0, "graph_construction")   # or install the package
+from phaseCodeBlockGraph import build_phase_codeblock_graph_from_oh_trajectory
+
+with open("output.jsonl") as f:
+    traj_data = json.loads(f.readline())
+
+json_path = build_phase_codeblock_graph_from_oh_trajectory(
+    traj_data=traj_data,
+    instance_id=traj_data["instance_id"],
+    output_dir="/path/to/output",
+    eval_report_path="/path/to/report.json",   # optional
+)
+print("Graph saved to:", json_path)
+```
+
+The returned JSON can be loaded back into NetworkX with:
+
+```python
+import json, networkx as nx
+from networkx.readwrite import json_graph
+
+with open(json_path) as f:
+    data = json.load(f)
+
+G = nx.node_link_graph(data, edges="edges")
+```
 
 ---
 

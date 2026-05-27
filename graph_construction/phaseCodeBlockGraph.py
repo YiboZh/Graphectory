@@ -695,7 +695,14 @@ class PhaseCodeBlockGraphBuilder:
     ) -> str:
         """Classify how the trajectory ended.
 
-        Priority: submit > error_stop > max_step > no_submit
+        Priority: submit (explicit) > error_stop > max_step > submit (patch) > no_submit
+
+        Standard CodeAct agents signal submission via ``action == "finish"``.
+        Observation-only agents (e.g. Claude in OpenHands) never emit a finish
+        action; instead, submission is inferred from a non-empty ``test_result.git_patch``
+        after all other conditions are checked.  Max-step detection uses both the
+        number of non-think actionable steps *and* the total step count so that
+        think-heavy trajectories are not misclassified as voluntary stops.
         """
         history = traj_data.get("history", [])
 
@@ -709,15 +716,24 @@ class PhaseCodeBlockGraphBuilder:
         if error:
             return "error_stop"
 
-        metadata = traj_data.get("metadata", {})
+        metadata = traj_data.get("metadata", {}) or {}
         max_iter = metadata.get("max_iterations")
-        metrics = traj_data.get("metrics", {})
+        metrics = traj_data.get("metrics", {}) or {}
         n_responses = len(metrics.get("response_latencies", []))
 
         if max_iter:
             n_actions = sum(1 for s in steps if not s.is_think_only)
-            if n_actions >= max_iter or n_responses >= max_iter:
+            # Also check total step count for agents that lack response_latency
+            # data and use think-only steps (e.g. Claude OpenHands format).
+            n_steps = len(steps)
+            if n_actions >= max_iter or n_responses >= max_iter or n_steps >= max_iter:
                 return "max_step"
+
+        # Observation-only agents (no explicit finish action) that produced a
+        # non-empty patch are treated as having submitted their work.
+        patch = (traj_data.get("test_result") or {}).get("git_patch", "")
+        if patch and patch.strip():
+            return "submit"
 
         return "no_submit"
 
