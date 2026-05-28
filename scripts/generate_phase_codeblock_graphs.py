@@ -6,22 +6,42 @@ Walks all model run directories under a raw-trajectories root, finds each
 output.jsonl, loads trajectories line-by-line, and saves a graph JSON per
 instance to the specified output directory.
 
+Two graph variants are supported via --graph_version:
+
+  v1 (default, version 1)
+      Full graph.  Code-block nodes are keyed by (file_path, start_line, end_line);
+      all files touched by the agent (viewed, searched, or edited) are included.
+      Output default: /home/yiboz7/data/processed_graphs/phase_codeblock_openhands
+
+  v2 (version 2, ablation)
+      Modified-files-only graph.  Code-block nodes are keyed by file_path only
+      (no line numbers stored on nodes).  Files that were only viewed or searched
+      but never edited/created/deleted are removed from the graph.
+      Output default: /home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v2
+
+Use --html to also render an interactive Plotly HTML figure for each graph.
+HTML files are saved alongside the JSON: {instance_id}.html in the same directory.
+
 Default raw input:  /home/yiboz7/data/raw_trajectories/OpenHands
-Default output:     /home/yiboz7/data/processed_graphs/phase_codeblock_openhands
 
 Usage
 -----
-# Process all models with defaults
+# Version 1 (default) — all models
 python scripts/generate_phase_codeblock_graphs.py
+
+# Version 2 ablation — all models, also render HTML
+python scripts/generate_phase_codeblock_graphs.py --graph_version v2 --html
 
 # Override paths / options
 python scripts/generate_phase_codeblock_graphs.py \\
+    --graph_version v2 \\
     --trajs_root  /path/to/raw_trajectories/OpenHands \\
-    --output_root /path/to/processed_graphs/phase_codeblock_openhands \\
-    --workers 8
+    --output_root /path/to/processed_graphs/phase_codeblock_openhands_v2 \\
+    --workers 8 --html
 
 # Process only specific model directories
 python scripts/generate_phase_codeblock_graphs.py \\
+    --graph_version v2 --html \\
     --model_dirs claude-sonnet-4_maxiter_100_N_v0.40.0-no-hint-run_1 \\
                  deepseek-chat_maxiter_100_N_v0.40.0-no-hint-run_1
 
@@ -32,6 +52,7 @@ python scripts/generate_phase_codeblock_graphs.py \\
 Output structure
 ----------------
 {output_root}/{model_dir}/{instance_id}/{instance_id}.json
+{output_root}/{model_dir}/{instance_id}/{instance_id}.html  (when --html)
 """
 
 from __future__ import annotations
@@ -54,7 +75,11 @@ for _p in [str(_REPO_ROOT), str(_GC_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from phaseCodeBlockGraph import build_phase_codeblock_graph_from_oh_trajectory
+from phaseCodeBlockGraph import (
+    build_phase_codeblock_graph_from_oh_trajectory,
+    build_phase_codeblock_graph_v2_from_oh_trajectory,
+)
+from plotly_renderer import render_graph_html
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
@@ -69,7 +94,8 @@ logger = logging.getLogger(__name__)
 # ── Default paths ─────────────────────────────────────────────────────────────
 
 DEFAULT_TRAJS_ROOT = "/home/yiboz7/data/raw_trajectories/OpenHands"
-DEFAULT_OUTPUT_ROOT = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands"
+DEFAULT_OUTPUT_ROOT_V1 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands"
+DEFAULT_OUTPUT_ROOT_V2 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v2"
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -90,6 +116,7 @@ class InstanceResult:
     instance_id: str
     status: str               # "success" | "skip" | "error"
     json_path: Optional[str] = None
+    html_path: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -183,20 +210,37 @@ def _process_one(
     traj_data: Dict[str, Any],
     output_dir: str,
     eval_report_path: Optional[str],
+    graph_version: str = "v1",
+    generate_html: bool = False,
 ) -> InstanceResult:
     """Top-level worker function (safe to call in a subprocess)."""
     try:
-        json_path = build_phase_codeblock_graph_from_oh_trajectory(
-            traj_data=traj_data,
-            instance_id=instance_id,
-            output_dir=output_dir,
-            eval_report_path=eval_report_path,
-        )
+        if graph_version == "v2":
+            json_path = build_phase_codeblock_graph_v2_from_oh_trajectory(
+                traj_data=traj_data,
+                instance_id=instance_id,
+                output_dir=output_dir,
+                eval_report_path=eval_report_path,
+            )
+        else:
+            json_path = build_phase_codeblock_graph_from_oh_trajectory(
+                traj_data=traj_data,
+                instance_id=instance_id,
+                output_dir=output_dir,
+                eval_report_path=eval_report_path,
+            )
+
+        html_path: Optional[str] = None
+        if generate_html and json_path:
+            html_path = str(Path(json_path).with_suffix(".html"))
+            render_graph_html(json_path, html_path)
+
         return InstanceResult(
             model_dir_name=model_dir_name,
             instance_id=instance_id,
             status="success",
             json_path=json_path,
+            html_path=html_path,
         )
     except Exception as exc:
         return InstanceResult(
@@ -210,13 +254,17 @@ def _process_one(
 def process_model_run(
     spec: ModelRunSpec,
     max_workers: int = 8,
+    graph_version: str = "v1",
+    generate_html: bool = False,
 ) -> Dict[str, List[InstanceResult]]:
     """Process all trajectories in one model-run directory."""
     logger.info("=" * 70)
-    logger.info("Model run : %s", spec.model_dir_name)
-    logger.info("JSONL     : %s", spec.jsonl_path)
-    logger.info("Output    : %s", spec.output_dir)
-    logger.info("Report    : %s", spec.eval_report_path or "(none)")
+    logger.info("Model run   : %s", spec.model_dir_name)
+    logger.info("JSONL       : %s", spec.jsonl_path)
+    logger.info("Output      : %s", spec.output_dir)
+    logger.info("Report      : %s", spec.eval_report_path or "(none)")
+    logger.info("Version     : %s", graph_version)
+    logger.info("HTML output : %s", "yes" if generate_html else "no")
 
     spec.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -267,6 +315,8 @@ def process_model_run(
                 tdata,
                 output_dir_str,
                 eval_report_str,
+                graph_version,
+                generate_html,
             ): iid
             for iid, tdata in to_process
         }
@@ -284,12 +334,14 @@ def process_model_run(
                 )
 
     elapsed = time.perf_counter() - t0
+    html_count = sum(1 for r in stats["success"] if r.html_path)
     logger.info(
-        "Model run done in %.1fs — success=%d  error=%d  skip=%d",
+        "Model run done in %.1fs — success=%d  error=%d  skip=%d  html=%d",
         elapsed,
         len(stats["success"]),
         len(stats["error"]),
         len(stats["skip"]),
+        html_count,
     )
     return stats
 
@@ -299,26 +351,34 @@ def process_model_run(
 def print_summary(
     all_stats: Dict[str, Dict[str, List[InstanceResult]]],
     output_root: Path,
+    graph_version: str = "v1",
+    generate_html: bool = False,
 ) -> None:
     """Print an aggregated processing summary across all model runs."""
     total_success = 0
     total_error = 0
     total_skip = 0
+    total_html = 0
 
     print()
     print("=" * 70)
     print("PHASE-CODEBLOCK GRAPH GENERATION SUMMARY")
     print("=" * 70)
+    print(f"  Graph version : {graph_version}")
+    print(f"  HTML figures  : {'yes' if generate_html else 'no'}")
+    print()
 
     for model_dir, stats in sorted(all_stats.items()):
         n_ok = len(stats["success"])
         n_err = len(stats["error"])
         n_skip = len(stats["skip"])
+        n_html = sum(1 for r in stats["success"] if r.html_path)
         total_success += n_ok
         total_error += n_err
         total_skip += n_skip
+        total_html += n_html
         print(f"  {model_dir}")
-        print(f"    success={n_ok}  error={n_err}  skip={n_skip}")
+        print(f"    success={n_ok}  error={n_err}  skip={n_skip}  html={n_html}")
         if stats["error"]:
             for r in stats["error"][:5]:
                 print(f"    ERR  {r.instance_id}: {r.reason}")
@@ -334,6 +394,7 @@ def print_summary(
     print("-" * 70)
     print(f"  TOTAL  trajectories processed : {total_success + total_error + total_skip}")
     print(f"  TOTAL  graphs generated       : {total_success}")
+    print(f"  TOTAL  HTML figures           : {total_html}")
     print(f"  TOTAL  failed trajectories    : {total_error}")
     print(f"  TOTAL  skipped trajectories   : {total_skip}")
     print(f"  Output root                   : {output_root}")
@@ -358,8 +419,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_root",
         type=str,
-        default=DEFAULT_OUTPUT_ROOT,
-        help=f"Root directory for output graphs (default: {DEFAULT_OUTPUT_ROOT})",
+        default=None,
+        help=(
+            "Root directory for output graphs. "
+            f"Defaults to {DEFAULT_OUTPUT_ROOT_V1} for v1 and {DEFAULT_OUTPUT_ROOT_V2} for v2."
+        ),
+    )
+    parser.add_argument(
+        "--graph_version",
+        type=str,
+        default="v1",
+        choices=["v1", "v2"],
+        help=(
+            "Graph variant to generate. "
+            "v1 (default): full graph with all touched files and line-range code-block nodes. "
+            "v2 (ablation): only modified-file nodes (view-only files removed), "
+            "no line numbers on code-block nodes."
+        ),
+    )
+    parser.add_argument(
+        "--html",
+        action="store_true",
+        help=(
+            "Also generate interactive Plotly HTML figures alongside each graph JSON. "
+            "Each HTML is saved as {instance_id}.html next to the JSON file."
+        ),
     )
     parser.add_argument(
         "--model_dirs",
@@ -400,12 +484,26 @@ def main() -> None:
         logging.getLogger().setLevel(logging.DEBUG)
 
     trajs_root = Path(args.trajs_root)
-    output_root = Path(args.output_root)
+    graph_version: str = args.graph_version
+    generate_html: bool = args.html
+
+    # Resolve output root: explicit flag > version-specific default
+    if args.output_root:
+        output_root = Path(args.output_root)
+    elif graph_version == "v2":
+        output_root = Path(DEFAULT_OUTPUT_ROOT_V2)
+    else:
+        output_root = Path(DEFAULT_OUTPUT_ROOT_V1)
+
     eval_report = Path(args.eval_report) if args.eval_report else None
 
     if eval_report and not eval_report.exists():
         logger.error("--eval_report path does not exist: %s", eval_report)
         sys.exit(1)
+
+    logger.info("Graph version : %s", graph_version)
+    logger.info("Output root   : %s", output_root)
+    logger.info("HTML figures  : %s", "yes" if generate_html else "no")
 
     specs = discover_model_runs(
         trajs_root=trajs_root,
@@ -424,13 +522,18 @@ def main() -> None:
 
     overall_t0 = time.perf_counter()
     for spec in specs:
-        stats = process_model_run(spec, max_workers=args.workers)
+        stats = process_model_run(
+            spec,
+            max_workers=args.workers,
+            graph_version=graph_version,
+            generate_html=generate_html,
+        )
         all_stats[spec.model_dir_name] = stats
 
     overall_elapsed = time.perf_counter() - overall_t0
     logger.info("All model runs completed in %.1fs", overall_elapsed)
 
-    print_summary(all_stats, output_root)
+    print_summary(all_stats, output_root, graph_version=graph_version, generate_html=generate_html)
 
     # Exit with non-zero if any errors occurred
     total_errors = sum(len(s["error"]) for s in all_stats.values())

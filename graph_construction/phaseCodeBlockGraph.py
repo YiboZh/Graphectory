@@ -239,6 +239,7 @@ class PhaseCodeBlockGraphBuilder:
         instance_id: str,
         output_dir: str,
         eval_report_path: Optional[str] = None,
+        graph_version: str = "v1",
     ) -> str:
         """Build and persist a phase-codeblock graph for one OH trajectory.
 
@@ -247,6 +248,8 @@ class PhaseCodeBlockGraphBuilder:
             instance_id:       SWE-bench instance ID
             output_dir:        Directory under which {instance_id}/{instance_id}.json is written
             eval_report_path:  Optional path to eval report JSON (for resolution_status)
+            graph_version:     Graph variant – ``"v1"`` (default, full graph with line ranges)
+                               or ``"v2"`` (ablation: only modified-file nodes, no line numbers)
 
         Returns:
             str: Absolute path to the saved graph JSON file
@@ -259,7 +262,7 @@ class PhaseCodeBlockGraphBuilder:
         term_type = self._detect_termination_type(traj_data, steps)
         last_obs_outcome = steps[-1].observation_outcome if steps else "unknown"
 
-        G = self._build_graph(phases, steps, term_type, last_obs_outcome)
+        G = self._build_graph(phases, steps, term_type, last_obs_outcome, graph_version=graph_version)
 
         # Graph-level metadata
         resolution_status = "unknown"
@@ -271,7 +274,8 @@ class PhaseCodeBlockGraphBuilder:
 
         G.graph["resolution_status"] = resolution_status
         G.graph["instance_name"] = instance_id
-        G.graph["graph_type"] = "phase_codeblock"
+        G.graph["graph_type"] = "phase_codeblock_v2" if graph_version == "v2" else "phase_codeblock"
+        G.graph["graph_version"] = graph_version
         G.graph["num_phases"] = len(phases)
         G.graph["num_code_blocks"] = sum(
             1 for _, d in G.nodes(data=True) if d.get("node_type") == "code_block"
@@ -745,8 +749,17 @@ class PhaseCodeBlockGraphBuilder:
         steps: List[StepInfo],
         term_type: str,
         last_obs_outcome: str,
+        graph_version: str = "v1",
     ) -> nx.MultiDiGraph:
-        """Assemble the full NetworkX graph from parsed phase and step data."""
+        """Assemble the full NetworkX graph from parsed phase and step data.
+
+        Args:
+            graph_version: ``"v1"`` builds the full graph (keyed by file path + line
+                range; all touched files included).  ``"v2"`` is the ablation variant:
+                code-block nodes are keyed by file path only (no line numbers stored),
+                and any file that was only viewed/searched but never modified
+                (edit/create/delete) is removed from the graph.
+        """
         G = nx.MultiDiGraph()
         counter = _NodeCounter()
 
@@ -757,7 +770,7 @@ class PhaseCodeBlockGraphBuilder:
         prev_key = start_key
 
         # Global code-block tracking
-        cb_key_map: Dict[Tuple, str] = {}           # (fp, sl, el) → node_key
+        cb_key_map: Dict[Tuple, str] = {}           # dedup-tuple → node_key
         cb_stats: Dict[str, Dict[str, int]] = {}    # node_key → {op_type: count}
 
         # ── Phase + CodeBlock Nodes ───────────────────────────────────────────
@@ -815,24 +828,43 @@ class PhaseCodeBlockGraphBuilder:
 
             prev_key = phase_key
 
-            # Ensure code-block nodes exist and accumulate global op stats
+            # Ensure code-block nodes exist and accumulate global op stats.
+            # v1: dedup key is (file_path, start_line, end_line); line range stored.
+            # v2: dedup key is (file_path,) only; no line range stored on node.
             for op in phase_acc._all_ops:
-                cb_tuple = (op.file_path, op.start_line, op.end_line)
+                if graph_version == "v2":
+                    cb_tuple: Tuple = (op.file_path,)
+                else:
+                    cb_tuple = (op.file_path, op.start_line, op.end_line)
+
                 if cb_tuple not in cb_key_map:
                     fp_hash = hashlib.md5(op.file_path.encode()).hexdigest()
-                    tag = f"{fp_hash[:8]}:{op.start_line}:{op.end_line}"
-                    cb_node_key = counter.next(f"code_block:{tag}")
-                    G.add_node(
-                        cb_node_key,
-                        node_type="code_block",
-                        file_path=op.file_path,
-                        file_path_hash=fp_hash,
-                        start_line=op.start_line,
-                        end_line=op.end_line,
-                        num_views=0,
-                        num_search_hits=0,
-                        num_edits=0,
-                    )
+                    if graph_version == "v2":
+                        tag = fp_hash[:8]
+                        cb_node_key = counter.next(f"code_block:{tag}")
+                        G.add_node(
+                            cb_node_key,
+                            node_type="code_block",
+                            file_path=op.file_path,
+                            file_path_hash=fp_hash,
+                            num_views=0,
+                            num_search_hits=0,
+                            num_edits=0,
+                        )
+                    else:
+                        tag = f"{fp_hash[:8]}:{op.start_line}:{op.end_line}"
+                        cb_node_key = counter.next(f"code_block:{tag}")
+                        G.add_node(
+                            cb_node_key,
+                            node_type="code_block",
+                            file_path=op.file_path,
+                            file_path_hash=fp_hash,
+                            start_line=op.start_line,
+                            end_line=op.end_line,
+                            num_views=0,
+                            num_search_hits=0,
+                            num_edits=0,
+                        )
                     cb_key_map[cb_tuple] = cb_node_key
                     cb_stats[cb_node_key] = defaultdict(int)
 
@@ -843,7 +875,10 @@ class PhaseCodeBlockGraphBuilder:
             # Aggregate op counts across all ops in this phase
             edge_counts: Dict[Tuple[str, str], int] = defaultdict(int)
             for op in phase_acc._all_ops:
-                cb_tuple = (op.file_path, op.start_line, op.end_line)
+                if graph_version == "v2":
+                    cb_tuple = (op.file_path,)
+                else:
+                    cb_tuple = (op.file_path, op.start_line, op.end_line)
                 cb_node_key = cb_key_map[cb_tuple]
                 edge_counts[(cb_node_key, op.op_type)] += 1
 
@@ -863,6 +898,17 @@ class PhaseCodeBlockGraphBuilder:
             G.nodes[cb_node_key]["num_edits"] = (
                 stats.get("edit", 0) + stats.get("create", 0) + stats.get("delete", 0)
             )
+
+        # v2 ablation: remove code-block nodes that were only viewed/searched but
+        # never modified (edit/create/delete).  NetworkX automatically removes all
+        # incident edges when a node is removed.
+        if graph_version == "v2":
+            view_only = [
+                n for n, d in G.nodes(data=True)
+                if d.get("node_type") == "code_block" and d.get("num_edits", 0) == 0
+            ]
+            for n in view_only:
+                G.remove_node(n)
 
         # ── Termination Node ──────────────────────────────────────────────────
         last_phase_type = phases[-1].phase_type if phases else "none"
@@ -932,9 +978,9 @@ def build_phase_codeblock_graph_from_oh_trajectory(
     output_dir: str,
     eval_report_path: Optional[str] = None,
 ) -> str:
-    """Build and save a phase-codeblock graph from one OpenHands trajectory.
+    """Build and save a phase-codeblock graph (v1) from one OpenHands trajectory.
 
-    This is the primary entry point for external callers.
+    This is the primary entry point for external callers (version 1 graph).
 
     Args:
         traj_data:         Parsed dict from one line of an OH output.jsonl file.
@@ -951,6 +997,43 @@ def build_phase_codeblock_graph_from_oh_trajectory(
         instance_id=instance_id,
         output_dir=output_dir,
         eval_report_path=eval_report_path,
+        graph_version="v1",
+    )
+
+
+def build_phase_codeblock_graph_v2_from_oh_trajectory(
+    traj_data: Dict[str, Any],
+    instance_id: str,
+    output_dir: str,
+    eval_report_path: Optional[str] = None,
+) -> str:
+    """Build and save a phase-codeblock graph (v2 ablation) from one OpenHands trajectory.
+
+    Version 2 differs from version 1 in two ways:
+
+    1. **Modified-files only** — code-block nodes that were only viewed or searched
+       (never edited/created/deleted) are removed.  Only files that the agent
+       actually patched or tested remain in the graph.
+    2. **No line numbers** — code-block nodes are deduplicated by file path only;
+       different view ranges of the same file merge into a single node.  Nodes
+       display only the file name (no ``:start-end`` line suffix).
+
+    Args:
+        traj_data:         Parsed dict from one line of an OH output.jsonl file.
+        instance_id:       SWE-bench instance ID (e.g. "django__django-12345").
+        output_dir:        Directory where {instance_id}/{instance_id}.json will be written.
+        eval_report_path:  Optional path to report.json for resolution_status lookup.
+
+    Returns:
+        str: Path to the saved graph JSON file.
+    """
+    builder = PhaseCodeBlockGraphBuilder()
+    return builder.build_from_oh_trajectory(
+        traj_data=traj_data,
+        instance_id=instance_id,
+        output_dir=output_dir,
+        eval_report_path=eval_report_path,
+        graph_version="v2",
     )
 
 
