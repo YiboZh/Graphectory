@@ -54,6 +54,11 @@ _TEST_CMDS: frozenset = frozenset(["pytest", "python", "python3", "python2", "py
 # Substrings that indicate a path is test-related
 _TEST_HINTS: Tuple[str, ...] = ("test_", "reproduc", "debug", "_test", "/tests/", "/test/")
 
+# OpenHands records the iteration cap as a top-level ``error`` string of the form
+# "Agent reached maximum iteration in headless mode. Current iteration: 100, ...".
+# This is the harness's max-step termination signal, not a crash.
+_MAXITER_ERROR_RE = re.compile(r"reached maximum iteration", re.IGNORECASE)
+
 # Regex: file-path-like strings extracted from raw bash commands
 _PATH_RE = re.compile(
     r"(?:^|\s)"
@@ -699,7 +704,7 @@ class PhaseCodeBlockGraphBuilder:
     ) -> str:
         """Classify how the trajectory ended.
 
-        Priority: submit (explicit) > error_stop > max_step > submit (patch) > no_submit
+        Priority: submit (explicit) > max_step > error_stop > submit (patch) > no_submit
 
         Standard CodeAct agents signal submission via ``action == "finish"``.
         Observation-only agents (e.g. Claude in OpenHands) never emit a finish
@@ -707,6 +712,13 @@ class PhaseCodeBlockGraphBuilder:
         after all other conditions are checked.  Max-step detection uses both the
         number of non-think actionable steps *and* the total step count so that
         think-heavy trajectories are not misclassified as voluntary stops.
+
+        Crucially, when OpenHands hits the iteration cap it records the cap as a
+        top-level ``error`` of the form *"Agent reached maximum iteration in
+        headless mode..."*.  This is the harness's **max-step** signal, not a
+        crash, so it must be classified as ``max_step`` and not swallowed by the
+        generic ``error_stop`` branch.  (Claude's OpenHands output leaves
+        ``error`` empty and instead relies on the count-based fallback below.)
         """
         history = traj_data.get("history", [])
 
@@ -716,7 +728,11 @@ class PhaseCodeBlockGraphBuilder:
             if raw_step.get("observation") == "finish":
                 return "submit"
 
+        # The iteration-cap RuntimeError is the harness's explicit max-step
+        # signal; route it to ``max_step`` before treating any error as a crash.
         error = traj_data.get("error")
+        if error and _MAXITER_ERROR_RE.search(str(error)):
+            return "max_step"
         if error:
             return "error_stop"
 

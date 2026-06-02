@@ -219,7 +219,7 @@ that were modified (edit, create, or delete operations) survive the ablation fil
 
 ### Termination Node
 
-Identical to v1.
+Identical to v1 — v2 shares the exact same `_detect_termination_type` routine.
 
 | Feature | Type | Description |
 |---------|------|-------------|
@@ -228,6 +228,20 @@ Identical to v1.
 | `final_step_idx` | int | Step index of the last processed step |
 | `last_phase` | string | `phase_type` of the last Phase Node |
 | `last_observation_outcome` | string | `"success"`, `"failure"`, or `"neutral"` |
+
+#### ⚠️ Bug fix (2026-06-01): iteration-cap mislabeled as `error_stop`
+
+Because v2 reuses v1's termination detection, it inherited the same bug: the OpenHands
+iteration-cap RuntimeError (`"Agent reached maximum iteration in headless mode..."`) was
+classified as `error_stop` instead of `max_step`, so **only `claude-sonnet-4` appeared to
+hit the cap** while the other (often longer) models showed 0% `max_step`. The fix adds a
+`_MAXITER_ERROR_RE` check ahead of the generic `error_stop` branch; v2 graphs were
+regenerated. Full root-cause analysis, the corrected priority table, and the corrected
+per-model distribution are documented in
+[`PHASE_CODEBLOCK_GRAPH_FEATURES.md` → Termination type detection](./PHASE_CODEBLOCK_GRAPH_FEATURES.md#termination-type-detection).
+Corrected `max_step` rates: deepseek-r1 1.5%, deepseek-chat 15.8%, claude 12.8%,
+devstral-small 37.2% (now a length proxy, with devstral — the longest model — hitting the
+cap most). Only `termination_type` is affected; all other v2 features are unchanged.
 
 ---
 

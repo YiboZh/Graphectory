@@ -552,12 +552,62 @@ Scans the full `history` list (including action-only steps) in priority order:
 | Priority | Condition | `termination_type` |
 |----------|-----------|-------------------|
 | 1 | Any step has `action == "finish"` or `observation == "finish"` | `"submit"` |
-| 2 | `traj_data["error"]` is not None | `"error_stop"` |
-| 3 | Count of non-think actionable steps ≥ `metadata["max_iterations"]`, OR count of model responses ≥ `max_iterations` | `"max_step"` |
-| 4 | None of the above | `"no_submit"` |
+| 2 | `traj_data["error"]` matches `_MAXITER_ERROR_RE` (`"reached maximum iteration"`) | `"max_step"` |
+| 3 | `traj_data["error"]` is not None (any other error) | `"error_stop"` |
+| 4 | Count of non-think actionable steps ≥ `metadata["max_iterations"]`, OR count of model responses ≥ `max_iterations`, OR total step count ≥ `max_iterations` | `"max_step"` |
+| 5 | Non-empty `test_result.git_patch` (observation-only agents that never emit `finish`) | `"submit"` |
+| 6 | None of the above | `"no_submit"` |
 
 The `"unknown"` value is reserved for the Termination Node's `last_observation_outcome` field
 when no steps were processed (empty trajectory), and is not a `termination_type`.
+
+### ⚠️ Bug fix (2026-06-01): iteration-cap mislabeled as `error_stop`
+
+**Symptom.** A cross-model audit of OpenHands runs found that **only `claude-sonnet-4`
+ever terminated via `max_step`** (12.8%), while `deepseek-chat`, `deepseek-r1-0528`, and
+`devstral-small` showed **0% `max_step`** and instead a large `error_stop` share
+(devstral 38.8%, deepseek-chat 18.2%). This is implausible — `devstral-small` actually
+runs *longer* than Claude (median 84 vs 64 steps) and should hit the cap **more**, not
+never.
+
+**Root cause.** When OpenHands hits the iteration cap it records the cap as a top-level
+field:
+
+```json
+"error": "RuntimeError: Agent reached maximum iteration in headless mode. Current iteration: 100, max iteration: 100"
+```
+
+The old priority table classified **any** non-empty `error` as `error_stop` (old
+priority 2) *before* the count-based `max_step` check (old priority 3). So for every
+non-Claude model the cap-termination was swallowed into `error_stop`. Claude's OpenHands
+output format leaves `error` empty (and emits no `metrics.response_latencies`), so Claude
+was the *only* model that fell through to the count-based `max_step` fallback — creating
+the false impression that "only Claude hits the cap."
+
+**Fix.** A new regex `_MAXITER_ERROR_RE = re.compile(r"reached maximum iteration",
+re.IGNORECASE)` is checked **before** the generic `error_stop` branch (new priority 2). The
+iteration-cap RuntimeError is the harness's explicit max-step signal and is now routed to
+`max_step`; only genuine crashes (LLM-unavailable, stuck-in-loop, bad-request, etc.) remain
+`error_stop`.
+
+**Corrected per-model distribution** (v1 graphs, regenerated 2026-06-01):
+
+| model | n | submit | max_step | error_stop | no_submit |
+|---|---:|---:|---:|---:|---:|
+| deepseek-r1-0528 | 474 | 97.5% | 1.5% | 1.1% | 0.2% |
+| deepseek-chat | 500 | 81.8% | 15.8% | 2.4% | 9.0% |
+| claude-sonnet-4 | 500 | 87.2% | 12.8% | 0.0% | 0.2% |
+| devstral-small | 500 | 61.2% | **37.2%** | 1.6% | 1.2% |
+
+`max_step` rate now tracks trajectory length (devstral longest → highest cap rate; Claude
+is mid-pack). Conditioning on long trajectories (≥60 steps), Claude has the *lowest*
+cap rate (22.8%) among the long models, vs deepseek-chat 76.7% and devstral 48.7% — i.e.
+Claude's long runs more often end in a voluntary `submit`. The downstream analysis lives in
+`Observability-predict/reports/phase_step_length_analysis/`.
+
+**Impact.** Only the Termination Node's `termination_type` attribute (and the derived
+`error_stop`/`max_step` counts) were affected; all other node/edge features are unchanged.
+Both v1 and v2 graphs share this single detection routine and were regenerated.
 
 ---
 
