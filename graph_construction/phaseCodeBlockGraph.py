@@ -210,6 +210,26 @@ class PhaseAccumulator:
         return sum(lats) / len(lats) if lats else None
 
 
+# ── Pruned graph variants (v3/v4/v5) feature flags ────────────────────────────
+# v3 = clean full graph: drop only cognitive/IO/latency (phase) + raw filename
+#      identity (code_block) + termination feature fields. Keep all structure,
+#      code_block op-intensity counts, and phase_code_operation edge attrs.
+# v4 = FS-pruned: phase nodes carry only Phase-5 selected primitive fields;
+#      code_block nodes structural-only; op-edge attrs removed (edges kept).
+# v5 = phase-only: no code_block nodes, no phase_code_operation edges.
+GRAPH_FEATURE_FLAGS: Dict[str, Dict[str, bool]] = {
+    "v3": dict(drop_cognitive=True, drop_phase_temporal_extra=False, codeblock_nodes=True,
+               codeblock_features=True, codeblock_filepath=False, op_edges=True,
+               op_edge_attrs=True, termination_features=False),
+    "v4": dict(drop_cognitive=True, drop_phase_temporal_extra=True, codeblock_nodes=True,
+               codeblock_features=False, codeblock_filepath=False, op_edges=True,
+               op_edge_attrs=False, termination_features=False),
+    "v5": dict(drop_cognitive=True, drop_phase_temporal_extra=True, codeblock_nodes=False,
+               codeblock_features=False, codeblock_filepath=False, op_edges=False,
+               op_edge_attrs=False, termination_features=False),
+}
+
+
 # ── Main builder class ────────────────────────────────────────────────────────
 
 class PhaseCodeBlockGraphBuilder:
@@ -279,7 +299,10 @@ class PhaseCodeBlockGraphBuilder:
 
         G.graph["resolution_status"] = resolution_status
         G.graph["instance_name"] = instance_id
-        G.graph["graph_type"] = "phase_codeblock_v2" if graph_version == "v2" else "phase_codeblock"
+        if graph_version in ("v2", "v3", "v4", "v5"):
+            G.graph["graph_type"] = f"phase_codeblock_{graph_version}"
+        else:
+            G.graph["graph_type"] = "phase_codeblock"
         G.graph["graph_version"] = graph_version
         G.graph["num_phases"] = len(phases)
         G.graph["num_code_blocks"] = sum(
@@ -779,6 +802,10 @@ class PhaseCodeBlockGraphBuilder:
         G = nx.MultiDiGraph()
         counter = _NodeCounter()
 
+        # Pruned-variant feature flags (None for v1/v2 = legacy behaviour).
+        flags = GRAPH_FEATURE_FLAGS.get(graph_version)
+        v2_style = graph_version != "v1"   # file-path-only code-block dedup keys
+
         # ── Start Node ────────────────────────────────────────────────────────
         start_key = counter.next("start")
         G.add_node(start_key, node_type="start", step_idx=0)
@@ -791,6 +818,14 @@ class PhaseCodeBlockGraphBuilder:
 
         # ── Phase + CodeBlock Nodes ───────────────────────────────────────────
         first_patch_seen = False
+        prev_phase_type: Optional[str] = None       # tracked locally so step_gap /
+        prev_end_step = 0                            # from_phase survive field pruning
+
+        emit_cb_nodes = (flags is None) or flags["codeblock_nodes"]
+        emit_cb_features = (flags is None) or flags["codeblock_features"]
+        emit_cb_filepath = (flags is None) or flags["codeblock_filepath"]
+        emit_op_edges = (flags is None) or flags["op_edges"]
+        emit_op_attrs = (flags is None) or flags["op_edge_attrs"]
 
         for phase_acc in phases:
             is_after_first_patch = first_patch_seen
@@ -798,8 +833,7 @@ class PhaseCodeBlockGraphBuilder:
                 first_patch_seen = True
 
             phase_key = counter.next(f"phase_{phase_acc.phase_index}")
-            G.add_node(
-                phase_key,
+            phase_attrs: Dict[str, Any] = dict(
                 node_type="phase",
                 phase_type=phase_acc.phase_type,
                 phase_index=phase_acc.phase_index,
@@ -827,118 +861,121 @@ class PhaseCodeBlockGraphBuilder:
                 latency_sum=phase_acc.latency_sum,
                 latency_mean=phase_acc.latency_mean,
             )
+            if flags:
+                if flags["drop_cognitive"]:
+                    for k in ("thought_length_sum", "thought_length_mean", "observation_length_sum",
+                              "observation_length_mean", "latency_sum", "latency_mean"):
+                        phase_attrs.pop(k, None)
+                if flags["drop_phase_temporal_extra"]:
+                    for k in ("start_step", "end_step", "num_steps"):
+                        phase_attrs.pop(k, None)
+            G.add_node(phase_key, **phase_attrs)
 
-            # Edge: previous node → this phase
+            # Edge: previous node → this phase (locals keep step_gap/from_phase
+            # correct even when start_step/end_step are pruned from phase nodes)
             if prev_key == start_key:
                 G.add_edge(start_key, phase_key, edge_type="start_to_phase")
             else:
-                prev_data = G.nodes[prev_key]
                 G.add_edge(
                     prev_key,
                     phase_key,
                     edge_type="phase_transition",
-                    from_phase=prev_data.get("phase_type", ""),
+                    from_phase=prev_phase_type or "",
                     to_phase=phase_acc.phase_type,
-                    step_gap=phase_acc.start_step - prev_data.get("end_step", 0),
+                    step_gap=phase_acc.start_step - prev_end_step,
                 )
 
             prev_key = phase_key
+            prev_phase_type = phase_acc.phase_type
+            prev_end_step = phase_acc.end_step
+
+            if not emit_cb_nodes:
+                continue
 
             # Ensure code-block nodes exist and accumulate global op stats.
             # v1: dedup key is (file_path, start_line, end_line); line range stored.
-            # v2: dedup key is (file_path,) only; no line range stored on node.
+            # v2/v3/v4: dedup key is (file_path,) only.
             for op in phase_acc._all_ops:
-                if graph_version == "v2":
-                    cb_tuple: Tuple = (op.file_path,)
-                else:
-                    cb_tuple = (op.file_path, op.start_line, op.end_line)
-
+                cb_tuple: Tuple = (op.file_path,) if v2_style else (op.file_path, op.start_line, op.end_line)
                 if cb_tuple not in cb_key_map:
                     fp_hash = hashlib.md5(op.file_path.encode()).hexdigest()
-                    if graph_version == "v2":
-                        tag = fp_hash[:8]
-                        cb_node_key = counter.next(f"code_block:{tag}")
-                        G.add_node(
-                            cb_node_key,
-                            node_type="code_block",
-                            file_path=op.file_path,
-                            file_path_hash=fp_hash,
-                            num_views=0,
-                            num_search_hits=0,
-                            num_edits=0,
-                        )
+                    if v2_style:
+                        cb_node_key = counter.next(f"code_block:{fp_hash[:8]}")
+                        cb_attrs: Dict[str, Any] = dict(node_type="code_block")
+                        if emit_cb_filepath:
+                            cb_attrs["file_path"] = op.file_path
+                            cb_attrs["file_path_hash"] = fp_hash
+                        if emit_cb_features:
+                            cb_attrs.update(num_views=0, num_search_hits=0, num_edits=0)
+                        G.add_node(cb_node_key, **cb_attrs)
                     else:
                         tag = f"{fp_hash[:8]}:{op.start_line}:{op.end_line}"
                         cb_node_key = counter.next(f"code_block:{tag}")
                         G.add_node(
-                            cb_node_key,
-                            node_type="code_block",
-                            file_path=op.file_path,
-                            file_path_hash=fp_hash,
-                            start_line=op.start_line,
-                            end_line=op.end_line,
-                            num_views=0,
-                            num_search_hits=0,
-                            num_edits=0,
+                            cb_node_key, node_type="code_block", file_path=op.file_path,
+                            file_path_hash=fp_hash, start_line=op.start_line, end_line=op.end_line,
+                            num_views=0, num_search_hits=0, num_edits=0,
                         )
                     cb_key_map[cb_tuple] = cb_node_key
                     cb_stats[cb_node_key] = defaultdict(int)
 
-                cb_node_key = cb_key_map[cb_tuple]
-                cb_stats[cb_node_key][op.op_type] += 1
+                cb_stats[cb_key_map[cb_tuple]][op.op_type] += 1
 
-            # Phase → CodeBlock edges: one edge per (phase, code_block, op_type)
-            # Aggregate op counts across all ops in this phase
+            if not emit_op_edges:
+                continue
+
+            # Phase → CodeBlock edges, aggregated per (code_block, op_type).
             edge_counts: Dict[Tuple[str, str], int] = defaultdict(int)
             for op in phase_acc._all_ops:
-                if graph_version == "v2":
-                    cb_tuple = (op.file_path,)
-                else:
-                    cb_tuple = (op.file_path, op.start_line, op.end_line)
-                cb_node_key = cb_key_map[cb_tuple]
-                edge_counts[(cb_node_key, op.op_type)] += 1
+                cb_tuple = (op.file_path,) if v2_style else (op.file_path, op.start_line, op.end_line)
+                edge_counts[(cb_key_map[cb_tuple], op.op_type)] += 1
 
-            for (cb_node_key, op_type), num_actions in edge_counts.items():
-                G.add_edge(
-                    phase_key,
-                    cb_node_key,
-                    edge_type="phase_code_operation",
-                    operation_type=op_type,
-                    num_actions=num_actions,
-                )
+            if emit_op_attrs:
+                for (cb_node_key, op_type), num_actions in edge_counts.items():
+                    G.add_edge(phase_key, cb_node_key, edge_type="phase_code_operation",
+                               operation_type=op_type, num_actions=num_actions)
+            else:
+                # one structural edge per (phase, code_block), no op attrs
+                seen_cb: Set[str] = set()
+                for (cb_node_key, _op_type) in edge_counts:
+                    if cb_node_key not in seen_cb:
+                        seen_cb.add(cb_node_key)
+                        G.add_edge(phase_key, cb_node_key, edge_type="phase_code_operation")
 
-        # Update code-block node aggregated stats
+        # Aggregated code-block stats (computed always; emitted only if features kept)
         for cb_node_key, stats in cb_stats.items():
-            G.nodes[cb_node_key]["num_views"] = stats.get("view", 0)
-            G.nodes[cb_node_key]["num_search_hits"] = stats.get("search_hit", 0)
-            G.nodes[cb_node_key]["num_edits"] = (
-                stats.get("edit", 0) + stats.get("create", 0) + stats.get("delete", 0)
-            )
+            n_edits = stats.get("edit", 0) + stats.get("create", 0) + stats.get("delete", 0)
+            if emit_cb_features:
+                G.nodes[cb_node_key]["num_views"] = stats.get("view", 0)
+                G.nodes[cb_node_key]["num_search_hits"] = stats.get("search_hit", 0)
+                G.nodes[cb_node_key]["num_edits"] = n_edits
 
-        # v2 ablation: remove code-block nodes that were only viewed/searched but
-        # never modified (edit/create/delete).  NetworkX automatically removes all
-        # incident edges when a node is removed.
-        if graph_version == "v2":
+        # Modified-files-only pruning: remove code-block nodes never edited
+        # (applies to every version that keys code blocks by file path: v2/v3/v4).
+        if emit_cb_nodes and v2_style:
             view_only = [
-                n for n, d in G.nodes(data=True)
-                if d.get("node_type") == "code_block" and d.get("num_edits", 0) == 0
+                n for n in list(cb_stats)
+                if (cb_stats[n].get("edit", 0) + cb_stats[n].get("create", 0)
+                    + cb_stats[n].get("delete", 0)) == 0
             ]
             for n in view_only:
-                G.remove_node(n)
+                if n in G:
+                    G.remove_node(n)
 
         # ── Termination Node ──────────────────────────────────────────────────
         last_phase_type = phases[-1].phase_type if phases else "none"
         final_step_idx = steps[-1].step_idx if steps else 0
 
         term_key = counter.next("termination")
-        G.add_node(
-            term_key,
-            node_type="termination",
-            termination_type=term_type,
-            final_step_idx=final_step_idx,
-            last_phase=last_phase_type,
-            last_observation_outcome=last_obs_outcome,
-        )
+        term_attrs: Dict[str, Any] = dict(node_type="termination")
+        if flags is None or flags["termination_features"]:
+            term_attrs.update(
+                termination_type=term_type,
+                final_step_idx=final_step_idx,
+                last_phase=last_phase_type,
+                last_observation_outcome=last_obs_outcome,
+            )
+        G.add_node(term_key, **term_attrs)
 
         edge_type = "phase_to_termination" if prev_key != start_key else "start_to_termination"
         G.add_edge(prev_key, term_key, edge_type=edge_type)
@@ -969,10 +1006,11 @@ class PhaseCodeBlockGraphBuilder:
         if phases and not phase_nodes:
             raise ValueError("Trajectory has phases but no phase nodes were added")
 
-        # Check temporal ordering
+        # Check temporal ordering. start_step/end_step may be pruned in v4/v5;
+        # the overlap check is skipped when they are absent.
         if len(phase_nodes) > 1:
             pdata = sorted(
-                (G.nodes[k]["phase_index"], G.nodes[k]["start_step"], G.nodes[k]["end_step"])
+                (G.nodes[k]["phase_index"], G.nodes[k].get("start_step"), G.nodes[k].get("end_step"))
                 for k in phase_nodes
             )
             for i, (pi, ss, _) in enumerate(pdata):
@@ -980,7 +1018,7 @@ class PhaseCodeBlockGraphBuilder:
                     raise ValueError(
                         f"Phase indices not sequential: {[p[0] for p in pdata]}"
                     )
-                if i > 0 and ss < pdata[i - 1][2]:
+                if i > 0 and ss is not None and pdata[i - 1][2] is not None and ss < pdata[i - 1][2]:
                     raise ValueError(
                         f"Phase {pi} start_step ({ss}) overlaps previous end_step ({pdata[i-1][2]})"
                     )
@@ -1051,6 +1089,43 @@ def build_phase_codeblock_graph_v2_from_oh_trajectory(
         eval_report_path=eval_report_path,
         graph_version="v2",
     )
+
+
+def _build_pruned(traj_data, instance_id, output_dir, eval_report_path, version):
+    return PhaseCodeBlockGraphBuilder().build_from_oh_trajectory(
+        traj_data=traj_data, instance_id=instance_id, output_dir=output_dir,
+        eval_report_path=eval_report_path, graph_version=version,
+    )
+
+
+def build_phase_codeblock_graph_v3_from_oh_trajectory(
+    traj_data: Dict[str, Any], instance_id: str, output_dir: str,
+    eval_report_path: Optional[str] = None,
+) -> str:
+    """v3 (clean full): v2 structure minus cognitive/IO/latency phase fields, raw
+    filename identity on code_block nodes, and termination feature fields. Keeps
+    code_block op-intensity counts and phase_code_operation edge attrs."""
+    return _build_pruned(traj_data, instance_id, output_dir, eval_report_path, "v3")
+
+
+def build_phase_codeblock_graph_v4_from_oh_trajectory(
+    traj_data: Dict[str, Any], instance_id: str, output_dir: str,
+    eval_report_path: Optional[str] = None,
+) -> str:
+    """v4 (FS-pruned): phase nodes carry only Phase-5 selected primitive fields;
+    code_block nodes structural-only; phase_code_operation edges kept but with no
+    operation_type/num_actions attrs."""
+    return _build_pruned(traj_data, instance_id, output_dir, eval_report_path, "v4")
+
+
+def build_phase_codeblock_graph_v5_from_oh_trajectory(
+    traj_data: Dict[str, Any], instance_id: str, output_dir: str,
+    eval_report_path: Optional[str] = None,
+) -> str:
+    """v5 (phase-only): no code_block nodes and no phase_code_operation edges;
+    start/phase/termination nodes with start_to_phase/phase_transition/
+    phase_to_termination edges; phase nodes carry the v4 selected fields."""
+    return _build_pruned(traj_data, instance_id, output_dir, eval_report_path, "v5")
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────

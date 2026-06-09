@@ -78,7 +78,17 @@ for _p in [str(_REPO_ROOT), str(_GC_DIR)]:
 from phaseCodeBlockGraph import (
     build_phase_codeblock_graph_from_oh_trajectory,
     build_phase_codeblock_graph_v2_from_oh_trajectory,
+    build_phase_codeblock_graph_v3_from_oh_trajectory,
+    build_phase_codeblock_graph_v4_from_oh_trajectory,
+    build_phase_codeblock_graph_v5_from_oh_trajectory,
 )
+
+_BUILDER_BY_VERSION = {
+    "v2": build_phase_codeblock_graph_v2_from_oh_trajectory,
+    "v3": build_phase_codeblock_graph_v3_from_oh_trajectory,
+    "v4": build_phase_codeblock_graph_v4_from_oh_trajectory,
+    "v5": build_phase_codeblock_graph_v5_from_oh_trajectory,
+}
 from plotly_renderer import render_graph_html
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -96,6 +106,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_TRAJS_ROOT = "/home/yiboz7/data/raw_trajectories/OpenHands"
 DEFAULT_OUTPUT_ROOT_V1 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands"
 DEFAULT_OUTPUT_ROOT_V2 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v2"
+DEFAULT_OUTPUT_ROOT_V3 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v3"
+DEFAULT_OUTPUT_ROOT_V4 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v4"
+DEFAULT_OUTPUT_ROOT_V5 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v5"
+_OUTPUT_ROOT_BY_VERSION = {
+    "v1": DEFAULT_OUTPUT_ROOT_V1, "v2": DEFAULT_OUTPUT_ROOT_V2,
+    "v3": DEFAULT_OUTPUT_ROOT_V3, "v4": DEFAULT_OUTPUT_ROOT_V4, "v5": DEFAULT_OUTPUT_ROOT_V5,
+}
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -215,20 +232,13 @@ def _process_one(
 ) -> InstanceResult:
     """Top-level worker function (safe to call in a subprocess)."""
     try:
-        if graph_version == "v2":
-            json_path = build_phase_codeblock_graph_v2_from_oh_trajectory(
-                traj_data=traj_data,
-                instance_id=instance_id,
-                output_dir=output_dir,
-                eval_report_path=eval_report_path,
-            )
-        else:
-            json_path = build_phase_codeblock_graph_from_oh_trajectory(
-                traj_data=traj_data,
-                instance_id=instance_id,
-                output_dir=output_dir,
-                eval_report_path=eval_report_path,
-            )
+        builder_fn = _BUILDER_BY_VERSION.get(graph_version, build_phase_codeblock_graph_from_oh_trajectory)
+        json_path = builder_fn(
+            traj_data=traj_data,
+            instance_id=instance_id,
+            output_dir=output_dir,
+            eval_report_path=eval_report_path,
+        )
 
         html_path: Optional[str] = None
         if generate_html and json_path:
@@ -429,12 +439,14 @@ def parse_args() -> argparse.Namespace:
         "--graph_version",
         type=str,
         default="v1",
-        choices=["v1", "v2"],
+        choices=["v1", "v2", "v3", "v4", "v5"],
         help=(
             "Graph variant to generate. "
-            "v1 (default): full graph with all touched files and line-range code-block nodes. "
-            "v2 (ablation): only modified-file nodes (view-only files removed), "
-            "no line numbers on code-block nodes."
+            "v1: full graph (line-range code-block nodes). "
+            "v2: modified-file nodes only, no line numbers. "
+            "v3: clean full (v2 minus cognitive/IO/latency, raw filename, termination feature fields). "
+            "v4: FS-pruned (selected phase fields, structural code_block nodes, no op-edge attrs). "
+            "v5: phase-only (no code_block nodes / phase_code_operation edges)."
         ),
     )
     parser.add_argument(
@@ -490,10 +502,8 @@ def main() -> None:
     # Resolve output root: explicit flag > version-specific default
     if args.output_root:
         output_root = Path(args.output_root)
-    elif graph_version == "v2":
-        output_root = Path(DEFAULT_OUTPUT_ROOT_V2)
     else:
-        output_root = Path(DEFAULT_OUTPUT_ROOT_V1)
+        output_root = Path(_OUTPUT_ROOT_BY_VERSION.get(graph_version, DEFAULT_OUTPUT_ROOT_V1))
 
     eval_report = Path(args.eval_report) if args.eval_report else None
 
