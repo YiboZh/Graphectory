@@ -4,21 +4,40 @@
 Phase classifier for agent actions (robust to dict/sequence `command`, heredocs, and shell None tool).
 
 Phases:
-  - "localization" : gathering info, searching, reading, or generating/trying tests *before* any patch
-  - "patch"        : creating/editing/deleting non-test assets
-  - "validation"   : (re-)running tests or test-like commands *after* a patch; viewing/creating/editing test assets *after* a patch
+  - "localization" : gathering info, searching, reading, or generating a *new* test/repro
+                     script *before* any patch
+  - "patch"        : editing existing code (any file, incl. test files that are the repair
+                     target) or creating a new non-test source file
+  - "validation"   : (re-)running tests or test-like commands *after* a patch; viewing test
+                     assets *after* a patch; creating a new test asset *after* a patch
   - "general"      : everything else
 
-Key rule (test generation & execution):
+#39 fix (2026-06-30) — two parts (see CHANGES.md in the #39 experiment folder):
+  (1) PATH-COMPONENT test detection. `_path_is_test` anchors the TEST_HINTS to real path
+      structure (a whole dir component `tests`/`test`/`testing`, or a `test_*` / `*_test`
+      basename, or a REPRO hint) instead of a raw substring. The old substring match treated
+      the SWE-bench workspace dir `pytest-dev__pytest__X.Y` as test-related (it contains
+      "test_"), so EVERY path in a pytest trajectory — including `src/_pytest/*.py` source —
+      looked test-related and no edit ever flipped `has_patch`. This is the dominant cause.
+  (2) EDIT-vs-CREATE rule (option (a), refined):
+      • EDITING AN EXISTING FILE (str_replace / insert / undo_edit / sed -i / perl -i):
+          - source file → "patch";
+          - genuine test file → "patch" if it is the repair target (no prior patch, the
+            pytest-dev case), else "validation" (post-patch verification, django/sympy);
+          - reproduction/debug script → key rule (localization before a patch, else validation).
+      • CREATING A NEW FILE (create / touch / `>` redirection / heredoc / tee) keeps the
+        test-path key rule: a new test/repro file → "localization"/"validation" (test
+        generation / understanding); a new non-test file → "patch".
+
+Key rule (test generation & execution) — applies to READ / EXECUTE / CREATE-NEW-TEST only:
   • If test generation/execution happens with NO prior "patch" in the phase history → "localization".
   • If it happens AFTER a "patch" → "validation".
 
 Other bash commands:
   • grep/find/cat/nl WITHOUT redirection (>, >>) → "localization" or ("validation" if test-related after patch).
   • Piped read-only operations (e.g., nl file.py | sed -n '10,20p') → "localization" (or "validation" if test-related after patch).
-  • If those commands CREATE/EDIT files (via redirection/heredoc/tee/in-place), treat as edits:
-      - if target is **non-test** → "patch"
-      - if target is **test** → apply key rule (loc before first patch; validation after)
+  • In-place edits (sed -i / perl -i) → "patch" (edit of existing code), repro-script exception aside.
+  • Redirection/heredoc/tee that CREATE files → test-path key rule if target is test/repro, else "patch".
 
 Function:
   get_phase(tool, subcommand, command, args, prev_phases=None, flags)
@@ -35,6 +54,13 @@ from typing import Iterable, List, Tuple, Any, Optional, Dict
 TEST_HINTS: Tuple[str, ...] = (
     "test_", "reproduc", "debug", "_test", "/tests/", "/test/",
 )
+
+# Paths hinting at the agent's own reproduction/debug script (a subset of TEST_HINTS).
+# Editing/creating one of these is *understanding*, not patching the codebase, so it is
+# excluded from the "edit-op ⇒ patch" rule and from has_patch. Kept deliberately narrow
+# ("test_" is NOT here) so that test_* files that are the *repair target* still count as
+# patches in testing-framework repos (the #39 pytest-dev fix).
+REPRO_HINTS: Tuple[str, ...] = ("reproduc", "debug")
 
 # Commands that typically *read/search* only; with redirection they can become edits.
 READONLY_CMDS: Tuple[str, ...] = ("grep", "find", "cat", "ls", "head", "tail", "awk", "nl")
@@ -112,9 +138,59 @@ def _is_piped_readonly_operation(cmd: str, tokens: List[str]) -> bool:
     has_output_redir = _contains_redirection(tokens)
     return has_pipe and not has_output_redir
 
+def _path_is_test(path: str) -> bool:
+    """Path-component-aware test-file detection (#39 fix).
+
+    The old check ``any(hint in path for hint in TEST_HINTS)`` was a raw *substring* match,
+    so the SWE-bench workspace/instance directory ``pytest-dev__pytest__X.Y`` matched
+    ``"test_"`` (inside "py**test__**X") and made **every** path in a pytest-dev trajectory —
+    including ``src/_pytest/*.py`` source files — look test-related. That poisoned the whole
+    trajectory's phase labels and stopped ``has_patch`` from ever flipping.
+
+    This version anchors the hints to real path structure: a path is test-related iff a
+    directory *component* is a conventional test dir (``tests`` / ``test`` / ``testing``), OR
+    the *basename* is a test/repro file (``test_*``, ``*_test``, or contains a REPRO hint).
+    ``pytest-dev__pytest__4.6`` is not a whole component named test/tests and is not a
+    basename, so source files are no longer mislabelled.
+    """
+    p = (path or "").replace("\\", "/")
+    comps = [c for c in p.split("/") if c]
+    if not comps:
+        return False
+    base = comps[-1]
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    if any(h in base for h in REPRO_HINTS):
+        return True
+    if any(c in ("tests", "test", "testing") for c in comps[:-1]):
+        return True
+    if base.startswith("test_") or stem.endswith("_test"):
+        return True
+    return False
+
 def _is_test_related(tokens: List[str], paths: List[str]) -> bool:
-    """Test-related if any path contains a hint from TEST_HINTS."""
-    return any(any(h in s for h in TEST_HINTS) for s in paths)
+    """Test-related if any extracted path is a test/repro file (path-component aware)."""
+    return any(_path_is_test(s) for s in paths)
+
+def _is_repro_related(paths: List[str]) -> bool:
+    """True if any path looks like a reproduction/debug script (REPRO_HINTS)."""
+    return any(any(h in s for h in REPRO_HINTS) for s in paths)
+
+def _edit_existing_phase(paths: List[str], has_patch: bool) -> str:
+    """Phase for an in-place edit of an EXISTING file (#39 option (a), refined).
+
+    - The agent's own reproduction/debug script → understanding (key rule: localization
+      before a patch, validation after).
+    - A genuine **test file**: the repair target when edited *before* any patch (this is the
+      pytest-dev case → ``patch``, flips ``has_patch``); verification of an existing fix when
+      edited *after* a patch (django/sympy test tweaks → ``validation``). This split is what
+      fixes pytest without relabelling legitimate post-patch verification edits.
+    - Any other existing file (source) → ``patch``.
+    """
+    if _is_repro_related(paths):
+        return "validation" if has_patch else "localization"
+    if any(_path_is_test(p) for p in paths):
+        return "validation" if has_patch else "patch"
+    return "patch"
 
 def _sre_phase(subcommand: Optional[str]) -> str:
     sub = (subcommand or "").lower()
@@ -292,19 +368,25 @@ def get_phase(
 
     # 1) str_replace_editor decisions (tool-specific)
     if (tool or "").lower() == "str_replace_editor":
-        phase = _sre_phase(subcommand)
-        if phase == "patch":
-            # If SRE edit targets tests, apply key rule (loc vs val by prior patch)
-            if _is_test_related(tokens, paths):
-                return "validation" if has_patch else "localization"
-            return "patch"
+        sub = (subcommand or "").lower()
+        if sub in SRE_EDIT_SUBCMDS:
+            if sub == "create":
+                # Creating a NEW file: test/repro generation → key rule (loc before first
+                # patch, validation after); a new non-test source file → patch.
+                if _is_test_related(tokens, paths):
+                    return "validation" if has_patch else "localization"
+                return "patch"
+            # str_replace / insert / undo_edit EDIT AN EXISTING FILE → patch even on a
+            # test-named path (the #39 fix for testing-framework repair targets).
+            return _edit_existing_phase(paths, has_patch)
 
         # 'view' (read-only) remains localization unless it's test-related AFTER a patch → validation
-        if phase == "localization" and (subcommand or "").lower() in SRE_READONLY_SUBCMDS:
+        if sub in SRE_READONLY_SUBCMDS:
             if _is_test_related(tokens, paths) and has_patch:
                 return "validation"
+            return "localization"
 
-        return phase  # "localization" or "general"
+        return "general"
 
     # 2) Python / pytest / pylint
     #    - Execution: apply key rule regardless of file hints.
@@ -393,8 +475,13 @@ def get_phase(
 
     # 4) Edit/creation commands (sed/touch/perl -i)
     is_perl_edit = (cmd == "perl" and "i" in flags)
-    if cmd in EDIT_CMDS or (cmd == "sed" and "i" in flags) or is_perl_edit:
-        # sed without -n, perl with -i are editing commands; treat targets accordingly
+    if (cmd == "sed" and "i" in flags) or is_perl_edit:
+        # sed -i / perl -i EDIT AN EXISTING FILE in place → patch even on a test-named path
+        # (#39 fix), except the agent's own reproduction/debug script before any patch.
+        return _edit_existing_phase(paths, has_patch)
+    if cmd in EDIT_CMDS:
+        # touch CREATES a (new, empty) file → keep the test-path key rule for new test/repro
+        # placeholders; a new non-test file → patch.
         return ("validation" if has_patch else "localization") if _is_test_related(tokens, paths) else "patch"
 
     # 5) Fallbacks:
@@ -427,6 +514,24 @@ if __name__ == "__main__":
         ("str_replace_editor", "create", {"path": "tests/test_file.py"}, None, None, None, "localization"),
         ("str_replace_editor", "create", {"path": "tests/test_file.py"}, None, ["patch"], None, "validation"),
         ("str_replace_editor", "view", {"path": "test_file.py"}, None, ["patch"], None, "validation"),
+        # ── #39 fix: editing an EXISTING test-named file = the repair target = patch ──
+        # pytest-dev family: the file under repair *is* a test_* / testing/ file.
+        ("str_replace_editor", "str_replace", {"path": "testing/test_assertion.py"}, None, None, None, "patch"),
+        ("str_replace_editor", "str_replace", {"path": "testing/python/test_fixtures.py"}, None, None, None, "patch"),
+        ("str_replace_editor", "insert", {"path": "/testbed/testing/test_cacheprovider.py", "insert_line": 10}, None, None, None, "patch"),
+        ("str_replace_editor", "str_replace", {"path": "src/_pytest/python.py"}, None, None, None, "patch"),
+        # str_replace on a test file AFTER a patch = verification of the fix → validation
+        # (the repair-target case only applies before the first patch).
+        ("str_replace_editor", "str_replace", {"path": "testing/test_assertion.py"}, None, ["patch"], None, "validation"),
+        # source file (src/_pytest/*) is NOT test-related under path-component detection,
+        # even though the workspace dir "pytest__X" contains the substring "test_".
+        ("str_replace_editor", "str_replace", {"path": "/workspace/pytest-dev__pytest__4.6/src/_pytest/pastebin.py"}, None, None, None, "patch"),
+        # Repro/debug script exception: editing the agent's own repro script before any
+        # patch stays localization (understanding), not a patch.
+        ("str_replace_editor", "str_replace", {"path": "/workspace/reproduce_bug.py"}, None, None, None, "localization"),
+        ("str_replace_editor", "str_replace", {"path": "/workspace/debug_script.py"}, None, None, None, "localization"),
+        # sed -i / perl -i editing an existing test file → patch (in-place edit of code).
+        (None, None, "sed", ["s/foo/bar/g", "testing/test_assertion.py"], None, {'i': True}, "patch"),
         ("str_replace_editor", "str_replace", {"path": "/testbed/django/db/backends/postgresql/client.py", "new_str": "        temp_pgpass = None\n        sigint_handler = signal.getsignal(signal.SIGINT)\n        try:\n            print(f\"DEBUG: passwd = '{passwd}'\")  # DEBUG\n            if passwd:\n                print(\"DEBUG: Creating temporary .pgpass file\")  # DEBUG\n                # Create temporary .pgpass file.\n                temp_pgpass = NamedTemporaryFile(mode='w+')}"}, None, None, None, "patch"),
         # Heredoc embedded in a single token (should be detected as redirection → edit-like).
         # Target is test-related and no prior patch → localization (test generation).
@@ -452,7 +557,9 @@ if __name__ == "__main__":
         (None, None, "nl", ["file.py", ">", "test_output.py"], ["patch"], None, "validation"),
 
         (None, None, "sed", ["/testbed/seaborn/_core/scales.py"], None, {"n": "1,440p"}, "localization"),
-        (None, None, "perl", ['s/old/new/g', 'test_file.py'], None, {'i': True, 'p': True, 'e': True}, "localization"),
+        # #39: perl -i on a test file is an in-place EDIT of existing code → patch
+        # (was "localization" pre-fix; updated to reflect the edit-op ⇒ patch rule).
+        (None, None, "perl", ['s/old/new/g', 'test_file.py'], None, {'i': True, 'p': True, 'e': True}, "patch"),
 
         (None, None, "python", ["-", "from pathlib import Path\np=Path('/testbed/seaborn/_core/scales.py')\ns=p.read_text()\nold=''' if prop.legend:\n axis.set_view_interval(vmin, vmax)\n locs = axis.major.locator()\n locs = locs[(vmin <= locs) & (locs <= vmax)]\n labels = axis.major.formatter.format_ticks(locs)\n new._legend = list(locs), list(labels)\n\n return new\n'''\nif old in s:\n new=''' if prop.legend:\n axis.set_view_interval(vmin, vmax)\n locs = axis.major.locator()\n locs = locs[(vmin <= locs) & (locs <= vmax)]\n formatter = axis.major.formatter\n labels = formatter.format_ticks(locs)\n # Attempt to capture any multiplicative offset used by the formatter\n offset = None\n try:\n # Many formatters (e.g. ScalarFormatter) provide a get_offset() method\n off = formatter.get_offset()\n except Exception:\n off = None\n if off:\n offset = str(off)\n new._legend = list(locs), list(labels) if offset is None else (list(locs), list(labels), offset)\n\n return new\n'''\n s=s.replace(old,new)\n p.write_text(s)\n print('patched')\nelse:\n print('pattern not found')"], None, {"__heredoc__": True}, "patch"),
     ]

@@ -81,6 +81,7 @@ from phaseCodeBlockGraph import (
     build_phase_codeblock_graph_v3_from_oh_trajectory,
     build_phase_codeblock_graph_v4_from_oh_trajectory,
     build_phase_codeblock_graph_v5_from_oh_trajectory,
+    build_phase_codeblock_graph_v6_from_oh_trajectory,
 )
 
 _BUILDER_BY_VERSION = {
@@ -88,6 +89,7 @@ _BUILDER_BY_VERSION = {
     "v3": build_phase_codeblock_graph_v3_from_oh_trajectory,
     "v4": build_phase_codeblock_graph_v4_from_oh_trajectory,
     "v5": build_phase_codeblock_graph_v5_from_oh_trajectory,
+    "v6": build_phase_codeblock_graph_v6_from_oh_trajectory,
 }
 from plotly_renderer import render_graph_html
 
@@ -109,9 +111,11 @@ DEFAULT_OUTPUT_ROOT_V2 = "/home/yiboz7/data/processed_graphs/phase_codeblock_ope
 DEFAULT_OUTPUT_ROOT_V3 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v3"
 DEFAULT_OUTPUT_ROOT_V4 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v4"
 DEFAULT_OUTPUT_ROOT_V5 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v5"
+DEFAULT_OUTPUT_ROOT_V6 = "/home/yiboz7/data/processed_graphs/phase_codeblock_openhands_v6"
 _OUTPUT_ROOT_BY_VERSION = {
     "v1": DEFAULT_OUTPUT_ROOT_V1, "v2": DEFAULT_OUTPUT_ROOT_V2,
     "v3": DEFAULT_OUTPUT_ROOT_V3, "v4": DEFAULT_OUTPUT_ROOT_V4, "v5": DEFAULT_OUTPUT_ROOT_V5,
+    "v6": DEFAULT_OUTPUT_ROOT_V6,
 }
 
 
@@ -439,14 +443,15 @@ def parse_args() -> argparse.Namespace:
         "--graph_version",
         type=str,
         default="v1",
-        choices=["v1", "v2", "v3", "v4", "v5"],
+        choices=["v1", "v2", "v3", "v4", "v5", "v6"],
         help=(
             "Graph variant to generate. "
             "v1: full graph (line-range code-block nodes). "
             "v2: modified-file nodes only, no line numbers. "
             "v3: clean full (v2 minus cognitive/IO/latency, raw filename, termination feature fields). "
             "v4: FS-pruned (selected phase fields, structural code_block nodes, no op-edge attrs). "
-            "v5: phase-only (no code_block nodes / phase_code_operation edges)."
+            "v5: phase-only (no code_block nodes / phase_code_operation edges). "
+            "v6: same schema as v2 but with the #39 corrected phase labels (edit-op => patch)."
         ),
     )
     parser.add_argument(

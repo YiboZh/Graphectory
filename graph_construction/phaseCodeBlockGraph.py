@@ -169,13 +169,19 @@ class PhaseAccumulator:
 
     @property
     def has_patch(self) -> bool:
-        """True if any edit/create/delete op on a non-test file occurred."""
-        for op in self._all_ops:
-            if op.op_type in ("edit", "create", "delete"):
-                fp = op.file_path.lower()
-                if not any(h in fp for h in _TEST_HINTS):
-                    return True
-        return False
+        """True if this phase contains a real code-modifying step (#39 fix).
+
+        Derived directly from the per-step phase label assigned by the fixed
+        ``mapPhase.get_phase``: a step is ``"patch"`` exactly when it makes a real code change
+        — a source edit, or an edit to a test file that is the repair target before any prior
+        patch. Deriving it from the per-step phase label keeps ``has_patch`` — and therefore
+        ``first_patch_seen`` / ``is_after_first_patch`` — perfectly consistent with the phase
+        labels, and robust to the substring false-positive that used to hide pytest-dev source
+        edits (the workspace dir ``pytest-dev__pytest__X.Y`` contains ``test_``). Test-file
+        edits that are *verification* (after a patch) are labelled ``validation`` by
+        ``get_phase`` and so correctly do NOT count here.
+        """
+        return any(s.phase == "patch" for s in self.steps)
 
     @property
     def has_validation(self) -> bool:
@@ -299,7 +305,7 @@ class PhaseCodeBlockGraphBuilder:
 
         G.graph["resolution_status"] = resolution_status
         G.graph["instance_name"] = instance_id
-        if graph_version in ("v2", "v3", "v4", "v5"):
+        if graph_version in ("v2", "v3", "v4", "v5", "v6"):
             G.graph["graph_type"] = f"phase_codeblock_{graph_version}"
         else:
             G.graph["graph_type"] = "phase_codeblock"
@@ -1126,6 +1132,19 @@ def build_phase_codeblock_graph_v5_from_oh_trajectory(
     start/phase/termination nodes with start_to_phase/phase_transition/
     phase_to_termination edges; phase nodes carry the v4 selected fields."""
     return _build_pruned(traj_data, instance_id, output_dir, eval_report_path, "v5")
+
+
+def build_phase_codeblock_graph_v6_from_oh_trajectory(
+    traj_data: Dict[str, Any], instance_id: str, output_dir: str,
+    eval_report_path: Optional[str] = None,
+) -> str:
+    """v6 (#39 corrected labels): structurally **identical** to v2 (modified-file
+    code-block nodes, file-path-only dedup, all phase/edge features kept), but built with
+    the fixed ``mapPhase.get_phase`` edit-vs-create rule and the fixed
+    ``PhaseAccumulator.has_patch``. Use this to regenerate graphs whose phase labels were
+    corrupted for testing-framework repos (pytest-dev) without overwriting the existing v2
+    set. ``graph_type`` is ``phase_codeblock_v6``; feature schema == v2."""
+    return _build_pruned(traj_data, instance_id, output_dir, eval_report_path, "v6")
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
